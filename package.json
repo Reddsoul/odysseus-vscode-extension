@@ -1,0 +1,98 @@
+{
+  "name": "odysseus-vscode",
+  "displayName": "Odysseus",
+  "description": "AI chat sidebar powered by your local Odysseus instance",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Chat"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "odysseus-sidebar",
+          "title": "Odysseus",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "odysseus-sidebar": [
+        {
+          "type": "webview",
+          "id": "odysseus.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "odysseus.openChat",
+        "title": "Odysseus: Open Chat"
+      },
+      {
+        "command": "odysseus.configure",
+        "title": "Odysseus: Configure Connection"
+      },
+      {
+        "command": "odysseus.newSession",
+        "title": "Odysseus: New Session"
+      },
+      {
+        "command": "odysseus.sendSelection",
+        "title": "Odysseus: Ask About Selection"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "odysseus.sendSelection",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o",
+        "when": "editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Odysseus",
+      "properties": {
+        "odysseus.url": {
+          "type": "string",
+          "default": "http://localhost:7860",
+          "description": "Odysseus server URL"
+        },
+        "odysseus.agentMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use agent (tools) mode. When enabled, Odysseus can read and edit files."
+        },
+        "odysseus.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model override (leave blank to use Odysseus session default)"
+        },
+        "odysseus.allowBash": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow agent to run terminal/bash commands"
+        },
+        "odysseus.allowWebSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow agent to search the web"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^6.0.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
