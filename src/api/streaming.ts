@@ -4,7 +4,7 @@ import * as http from "http";
 export type OdysseyEvent =
   | { type: "delta"; text: string }
   | { type: "thinking"; text: string }
-  | { type: "tool_start"; tool: string; command?: string; round?: number }
+  | { type: "tool_start"; tool: string; command?: string; round?: number; tool_input?: string }
   | { type: "tool_output"; tool: string; output: string; exit_code?: number }
   | { type: "agent_step"; round: number }
   | { type: "error"; message: string }
@@ -58,7 +58,12 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
     Accept: "text/event-stream",
   };
   if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+    // ody_ tokens are API tokens (Bearer); otherwise it's a session cookie.
+    if (token.startsWith("ody_")) {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else {
+      headers["Cookie"] = `odysseus_session=${token}`;
+    }
   }
 
   return new Promise((resolve, reject) => {
@@ -128,11 +133,20 @@ function parseEvent(data: Record<string, unknown>): OdysseyEvent | null {
     return { type: "delta", text: data.delta };
   }
   if (data.type === "tool_start") {
+    // NOTE: backend currently only emits `command` for bash; there is no generic
+    // structured-args field. We capture `tool_input`/`input`/`args` if present so
+    // verbose mode can render real args once the backend supplies them.
+    let toolInput: string | undefined;
+    const rawInput = data.tool_input ?? data.input ?? data.args;
+    if (rawInput !== undefined && rawInput !== null) {
+      toolInput = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
+    }
     return {
       type: "tool_start",
       tool: String(data.tool ?? ""),
       command: data.command !== undefined ? String(data.command) : undefined,
       round: typeof data.round === "number" ? data.round : undefined,
+      tool_input: toolInput,
     };
   }
   if (data.type === "tool_output") {

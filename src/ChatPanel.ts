@@ -23,10 +23,15 @@ export class ChatPanel {
   private currentModel = "";
   private currentEndpointUrl = "";
   private disposables: vscode.Disposable[] = [];
+  private pendingSessionId?: string;
 
-  public static createOrShow(context: vscode.ExtensionContext): ChatPanel {
+  /** Called when the chat panel is disposed, so the sidebar can refresh its list. */
+  public static onDidClose?: () => void;
+
+  public static createOrShow(context: vscode.ExtensionContext, sessionId?: string): ChatPanel {
     if (ChatPanel.instance) {
       ChatPanel.instance.panel.reveal(vscode.ViewColumn.Beside, true);
+      if (sessionId) { ChatPanel.instance.loadSession(sessionId); }
       return ChatPanel.instance;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -39,7 +44,7 @@ export class ChatPanel {
         localResourceRoots: [],
       }
     );
-    ChatPanel.instance = new ChatPanel(panel, context);
+    ChatPanel.instance = new ChatPanel(panel, context, sessionId);
     return ChatPanel.instance;
   }
 
@@ -49,9 +54,11 @@ export class ChatPanel {
 
   private constructor(
     panel: vscode.WebviewPanel,
-    private readonly context: vscode.ExtensionContext
+    private readonly context: vscode.ExtensionContext,
+    sessionId?: string
   ) {
     this.panel = panel;
+    this.pendingSessionId = sessionId;
     this.panel.iconPath = vscode.Uri.parse(
       "data:image/svg+xml," +
         encodeURIComponent(
@@ -75,6 +82,7 @@ export class ChatPanel {
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables = [];
+    ChatPanel.onDidClose?.();
   }
 
   private getUrl(): string {
@@ -112,7 +120,34 @@ export class ChatPanel {
     setTimeout(() => this.sendModelsToWebview(), 1000);
   }
 
+  /** Switch the panel to an existing session (from the history sidebar). */
+  async loadSession(sessionId: string): Promise<void> {
+    if (!this.client || !sessionId) { return; }
+    this.pendingSessionId = sessionId;
+    this.docSync?.reset();
+    await this.ensureSession();
+    // No message-history endpoint on the backend, so reset the view to the
+    // chosen session rather than replaying past messages.
+    this.postMessage({ type: "clearMessages" });
+    this.panel.reveal(vscode.ViewColumn.Beside, true);
+  }
+
   private async ensureSession(): Promise<void> {
+    // If a specific session was requested (history sidebar), load it directly.
+    if (this.pendingSessionId && this.client) {
+      const id = this.pendingSessionId;
+      this.pendingSessionId = undefined;
+      const existing = await this.client.getSession(id);
+      if (existing) {
+        this.sessionId = id;
+        if (existing.model)        { this.currentModel = existing.model; }
+        if (existing.endpoint_url) { this.currentEndpointUrl = existing.endpoint_url; }
+        await this.context.workspaceState.update("odysseus.sessionId", id);
+        return;
+      }
+      // Fall through to normal resolution if the session no longer exists.
+    }
+
     const savedId = this.context.workspaceState.get<string>("odysseus.sessionId");
     if (savedId && this.client) {
       const existing = await this.client.getSession(savedId);
@@ -180,7 +215,7 @@ export class ChatPanel {
       case "selectModel": await this.handleSelectModel(String(msg.model ?? ""), String(msg.endpointUrl ?? "")); break;
       case "newSession":  await this.newSession(); break;
       case "retry":       await this.init(); break;
-      case "startAuth":   await this.startBrowserAuth(); break;
+      case "login":       await this.handleLogin(String(msg.username ?? ""), String(msg.password ?? ""), String(msg.totp ?? "")); break;
       case "setUrl":      await this.handleSetUrl(String(msg.url ?? "")); break;
     }
   }
@@ -203,41 +238,27 @@ export class ChatPanel {
     await this.init();
   }
 
-  private async startBrowserAuth(): Promise<void> {
-    const http = await import("http");
-    const net  = await import("net");
+  private async handleLogin(username: string, password: string, totp: string): Promise<void> {
     const url = this.getUrl();
-    const state = generateNonce();
+    if (!this.client) { this.client = new OdysseusClient(url); }
+    const result = await this.client.login(username, password, totp || undefined);
 
-    const { server, port } = await new Promise<{ server: import("http").Server; port: number }>(
-      (resolve, reject) => {
-        const srv = http.createServer();
-        srv.listen(0, "127.0.0.1", () => {
-          const addr = srv.address() as import("net").AddressInfo;
-          resolve({ server: srv, port: addr.port });
-        });
-        srv.on("error", reject);
-      }
-    );
-
-    const callbackUrl = `http://localhost:${port}/vscode-callback`;
-    const authUrl = `${url}/api/auth/authorize?callback=${encodeURIComponent(callbackUrl)}&state=${encodeURIComponent(state)}`;
-    this.panel.webview.html = this.buildHtml("authwaiting");
-    await vscode.env.openExternal(vscode.Uri.parse(authUrl));
-
-    try {
-      const token = await waitForCallback(server, state, 300_000);
-      await this.context.secrets.store("odysseus.token", token);
-      this.client = new OdysseusClient(url, token);
-      this.docSync = new DocSync(this.client);
-      await this.ensureSession();
-      this.panel.webview.html = this.buildHtml("chat", this.currentModel);
-      setTimeout(() => this.sendModelsToWebview(), 300);
-      setTimeout(() => this.sendModelsToWebview(), 1000);
-    } catch {
-      server.close();
-      this.panel.webview.html = this.buildHtml("auth");
+    if (result.requiresTotp) {
+      this.postMessage({ type: "requireTotp" });
+      return;
     }
+    if (!result.ok || !result.token) {
+      this.postMessage({ type: "authError", message: result.error ?? "Login failed." });
+      return;
+    }
+
+    await this.context.secrets.store("odysseus.token", result.token);
+    this.client = new OdysseusClient(url, result.token);
+    this.docSync = new DocSync(this.client);
+    await this.ensureSession();
+    this.panel.webview.html = this.buildHtml("chat", this.currentModel);
+    setTimeout(() => this.sendModelsToWebview(), 300);
+    setTimeout(() => this.sendModelsToWebview(), 1000);
   }
 
   private async handleSend(text: string, opts: SendOpts = {}): Promise<void> {
@@ -309,7 +330,7 @@ export class ChatPanel {
     this.panel.webview.postMessage(msg);
   }
 
-  private buildHtml(state: "loading" | "disconnected" | "auth" | "authwaiting" | "chat", initialModel?: string): string {
+  private buildHtml(state: "loading" | "disconnected" | "auth" | "chat", initialModel?: string): string {
     const nonce = generateNonce();
     return `<!DOCTYPE html>
 <html lang="en">
@@ -493,6 +514,38 @@ body {
   line-height: 1.5;
 }
 .tool-output.open { display: block; }
+
+/* Verbose: tool input args */
+.tool-input {
+  display: none;
+  background: var(--vscode-textCodeBlock-background, rgba(255,255,255,0.04));
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  padding: 6px 10px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-left: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.08));
+  border-right: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.08));
+  opacity: 0.8;
+  max-height: 200px;
+  overflow-y: auto;
+}
+body.verbose .tool-input.has-input { display: block; }
+
+/* Reasoning steps count header */
+.chat-header {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 20px;
+  font-size: 11px;
+  opacity: 0.55;
+  border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.06));
+  font-variant-numeric: tabular-nums;
+}
+body.verbose .chat-header { display: flex; }
 
 /* Thinking block — matches Odysseus style */
 .thinking-section {
@@ -798,21 +851,19 @@ ${state === "disconnected" ? `
 
 ${state === "auth" ? `
 <div id="state-view">
-  <h2>Connect to Odysseus</h2>
-  <p>Opens Odysseus in your browser. Click <strong>Allow</strong> to authorize VS Code. You only need to do this once.</p>
+  <h2>Sign in to Odysseus</h2>
+  <input class="url-input" id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
+  <input class="url-input" id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
+  <input class="url-input" id="login-totp" type="text" placeholder="2FA code" inputmode="numeric" autocomplete="one-time-code" style="display:none">
   <div class="error-msg" id="auth-error" style="display:none"></div>
-  <button class="btn" id="connect-btn">Connect via Browser</button>
-</div>` : ""}
-
-${state === "authwaiting" ? `
-<div id="state-view">
-  <div class="spinner"></div>
-  <h2>Waiting for approval…</h2>
-  <p>Odysseus opened in your browser. Click <strong>Allow</strong> to connect.</p>
+  <button class="btn" id="login-btn">Sign in</button>
 </div>` : ""}
 
 ${state === "chat" ? `
 <div id="chat-view">
+  <div class="chat-header" id="chat-header">
+    <span id="reasoning-count">0 tool calls · 0 thinking blocks</span>
+  </div>
   <div id="messages"></div>
 
   <div class="chat-input-bar">
@@ -842,6 +893,10 @@ ${state === "chat" ? `
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           <span>Terminal</span>
         </button>
+        <button class="icon-btn" id="verbose-btn" title="Verbose — show thinking &amp; tool args (Ctrl+O toggles all)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          <span>Verbose</span>
+        </button>
       </div>
       <div class="chat-input-right">
         <div class="mode-toggle">
@@ -868,12 +923,34 @@ console.log('[OdysseusWebview] script start');
 const retryBtn   = document.getElementById('retry-btn');
 const urlBtn     = document.getElementById('url-btn');
 const urlInput   = document.getElementById('url-input');
-const connectBtn = document.getElementById('connect-btn');
 const authError  = document.getElementById('auth-error');
 if (retryBtn)   retryBtn.onclick   = () => vscode.postMessage({ type: 'retry' });
-if (connectBtn) connectBtn.onclick = () => vscode.postMessage({ type: 'startAuth' });
 if (urlBtn)     urlBtn.onclick     = () => vscode.postMessage({ type: 'setUrl', url: urlInput?.value ?? '' });
 if (urlInput)   urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') urlBtn?.click(); });
+
+/* ── Login form ─────────────────────────────────── */
+const loginBtn  = document.getElementById('login-btn');
+const loginUser = document.getElementById('login-user');
+const loginPass = document.getElementById('login-pass');
+const loginTotp = document.getElementById('login-totp');
+function submitLogin() {
+  if (!loginUser || !loginPass) return;
+  const username = loginUser.value.trim();
+  const password = loginPass.value;
+  const totp = loginTotp && loginTotp.style.display !== 'none' ? loginTotp.value.trim() : '';
+  if (!username || !password) {
+    if (authError) { authError.textContent = 'Enter username and password.'; authError.style.display = ''; }
+    return;
+  }
+  if (authError) authError.style.display = 'none';
+  if (loginBtn) { loginBtn.disabled = true; loginBtn.textContent = 'Signing in…'; }
+  vscode.postMessage({ type: 'login', username, password, totp });
+}
+if (loginBtn) loginBtn.onclick = submitLogin;
+[loginUser, loginPass, loginTotp].forEach(el => {
+  if (el) el.addEventListener('keydown', e => { if (e.key === 'Enter') submitLogin(); });
+});
+if (loginUser) setTimeout(() => loginUser.focus(), 50);
 
 /* ── Model picker ───────────────────────────────── */
 const pickerBtn    = document.getElementById('model-picker-btn');
@@ -958,6 +1035,46 @@ let agentMode = true;
 
 if (webBtn)  webBtn.addEventListener('click',  () => { useWeb  = !useWeb;  webBtn.classList.toggle('active',  useWeb);  });
 if (bashBtn) bashBtn.addEventListener('click', () => { useBash = !useBash; bashBtn.classList.toggle('active', useBash); });
+
+/* ── Verbose toggle ─────────────────────────────── */
+const verboseBtn = document.getElementById('verbose-btn');
+let verboseMode = false;
+let toolCallCount = 0;
+let thinkingBlockCount = 0;
+
+function updateReasoningCount() {
+  const el = document.getElementById('reasoning-count');
+  if (el) el.textContent = toolCallCount + ' tool call' + (toolCallCount === 1 ? '' : 's') +
+    ' · ' + thinkingBlockCount + ' thinking block' + (thinkingBlockCount === 1 ? '' : 's');
+}
+
+function applyVerbose() {
+  document.body.classList.toggle('verbose', verboseMode);
+  verboseBtn?.classList.toggle('active', verboseMode);
+  // Expand/collapse every thinking block to match the new mode
+  document.querySelectorAll('.thinking-section').forEach(sec => setThinkingOpen(sec, verboseMode));
+  updateReasoningCount();
+}
+
+function setThinkingOpen(section, open) {
+  const content = section.querySelector('.thinking-content');
+  const chevron = section.querySelector('.thinking-chevron');
+  content?.classList.toggle('open', open);
+  chevron?.classList.toggle('open', open);
+}
+
+if (verboseBtn) verboseBtn.addEventListener('click', () => { verboseMode = !verboseMode; applyVerbose(); });
+
+/* Ctrl+O — toggle expand/collapse of ALL thinking blocks at once */
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'o' || e.key === 'O')) {
+    e.preventDefault();
+    const sections = [...document.querySelectorAll('.thinking-section')];
+    // If any is collapsed, expand all; otherwise collapse all
+    const anyClosed = sections.some(s => !s.querySelector('.thinking-content')?.classList.contains('open'));
+    sections.forEach(s => setThinkingOpen(s, anyClosed));
+  }
+});
 if (modeAgent) modeAgent.addEventListener('click', () => { agentMode = true;  modeAgent.classList.add('active'); modeChat?.classList.remove('active'); });
 if (modeChat)  modeChat.addEventListener('click',  () => { agentMode = false; modeChat.classList.add('active');  modeAgent?.classList.remove('active'); });
 
@@ -1117,6 +1234,10 @@ function startThinking() {
     chevron.classList.toggle('open');
   });
   currentAssistantEl.insertBefore(currentThinkingEl, currentBodyEl);
+  // Verbose: auto-expand on render; default: stay collapsed
+  setThinkingOpen(currentThinkingEl, verboseMode);
+  thinkingBlockCount++;
+  updateReasoningCount();
   scrollBottom();
 }
 
@@ -1138,7 +1259,7 @@ function finishThinking() {
   const header = currentThinkingEl.querySelector('.thinking-header');
   const label  = currentThinkingEl.querySelector('.thinking-label');
   const words  = thinkingText.trim().split(/\\s+/).length;
-  if (label) label.textContent = \`💭 Thought (\${words} words)\`;
+  if (label) label.textContent = \`💭 thinking (\${words} words)\`;
   currentThinkingEl = null;
 }
 
@@ -1185,8 +1306,11 @@ function appendDelta(text) {
   scrollBottom();
 }
 
-function addTool(tool, command, round) {
+function addTool(tool, command, round, toolInput) {
   if (!currentAssistantEl) return;
+
+  toolCallCount++;
+  updateReasoningCount();
 
   // Show round header when round number changes
   if (round != null && round !== currentRound) {
@@ -1208,11 +1332,19 @@ function addTool(tool, command, round) {
     \`<span class="tool-badge \${meta.badgeCls}">\${esc(meta.badge)}</span>\` +
     \`<span class="tool-name">\${esc(meta.name)}</span>\` +
     (cmd ? \`<span class="tool-cmd">\${cmd}</span>\` : '');
+
+  // Verbose: full tool input args (falls back to full command when backend sends no args)
+  const inputText = toolInput || command || '';
+  const inputPre = document.createElement('pre');
+  inputPre.className = 'tool-input' + (inputText ? ' has-input' : '');
+  if (inputText) inputPre.textContent = inputText;
+
   const out = document.createElement('div');
   out.className = 'tool-output';
   if (meta.autoOpen) out.classList.add('open');
   chip.addEventListener('click', () => out.classList.toggle('open'));
   currentToolWrap.appendChild(chip);
+  currentToolWrap.appendChild(inputPre);
   currentToolWrap.appendChild(out);
   currentAssistantEl.appendChild(currentToolWrap);
   if (currentStatusEl) currentAssistantEl.appendChild(currentStatusEl);
@@ -1267,6 +1399,7 @@ window.addEventListener('message', e => {
       if (messagesEl) messagesEl.innerHTML = '';
       currentAssistantEl = currentBodyEl = currentToolWrap = currentStatusEl = null;
       currentThinkingEl = null; thinkingText = ''; currentRound = 0;
+      toolCallCount = 0; thinkingBlockCount = 0; updateReasoningCount();
       break;
     case 'userMessage':    setBusy(true); addUserMsg(msg.text); break;
     case 'assistantStart': startAssistant(); break;
@@ -1281,7 +1414,7 @@ window.addEventListener('message', e => {
         if (currentThinkingEl) finishThinking();
         appendDelta(ev.text);
       }
-      if (ev.type === 'tool_start')  addTool(ev.tool, ev.command, ev.round);
+      if (ev.type === 'tool_start')  addTool(ev.tool, ev.command, ev.round, ev.tool_input);
       if (ev.type === 'tool_output') finishTool(ev.output, ev.exit_code);
       if (ev.type === 'agent_step')  addStep(ev.round);
       if (ev.type === 'error') {
@@ -1310,6 +1443,12 @@ window.addEventListener('message', e => {
       break;
     case 'authError':
       if (authError) { authError.textContent = msg.message; authError.style.display = ''; }
+      if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
+      break;
+    case 'requireTotp':
+      if (loginTotp) { loginTotp.style.display = ''; loginTotp.focus(); }
+      if (authError) { authError.textContent = 'Enter your 2FA code.'; authError.style.display = ''; }
+      if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
       break;
   }
 });
@@ -1343,40 +1482,6 @@ function parseWrittenPath(tool: string, output: string): string | null {
     return m ? m[1].trim() : null;
   }
   return null;
-}
-
-function waitForCallback(
-  server: import("http").Server,
-  expectedState: string,
-  timeoutMs: number
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      server.close();
-      reject(new Error("Timed out waiting for browser authorization (5 min)."));
-    }, timeoutMs);
-
-    server.on("request", (req, res) => {
-      const reqUrl = new URL(req.url ?? "/", "http://localhost");
-      const token = reqUrl.searchParams.get("token");
-      const state = reqUrl.searchParams.get("state");
-      const error = reqUrl.searchParams.get("error");
-      clearTimeout(timer);
-      server.close();
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      if (token && state === expectedState) {
-        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Connected</title>
-<style>body{font-family:-apple-system,sans-serif;text-align:center;margin-top:100px;background:#0f0f0f;color:#e8e8e8}</style>
-</head><body><h2>✓ Connected!</h2><p>VS Code is now connected to Odysseus.<br>You can close this tab.</p></body></html>`);
-        resolve(token);
-      } else {
-        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Denied</title>
-<style>body{font-family:-apple-system,sans-serif;text-align:center;margin-top:100px;background:#0f0f0f;color:#e8e8e8}</style>
-</head><body><h2>Authorization denied</h2><p>You can close this tab.</p></body></html>`);
-        reject(new Error(error === "denied" ? "Authorization denied." : "Invalid callback."));
-      }
-    });
-  });
 }
 
 function generateNonce(): string {

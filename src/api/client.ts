@@ -5,6 +5,28 @@ export interface AuthStatus {
   authenticated: boolean;
   configured: boolean;
   username?: string;
+  is_admin?: boolean;
+  signup_enabled?: boolean;
+}
+
+export interface LoginResult {
+  ok: boolean;
+  token?: string;
+  username?: string;
+  requiresTotp?: boolean;
+  error?: string;
+}
+
+/** The session cookie name the Odysseus backend issues on login. */
+export const SESSION_COOKIE = "odysseus_session";
+
+/** Extract a cookie value from a Set-Cookie header list. */
+function extractCookie(setCookie: string[] | undefined, name: string): string | undefined {
+  for (const line of setCookie ?? []) {
+    const m = line.match(new RegExp(`^${name}=([^;]+)`));
+    if (m) { return m[1]; }
+  }
+  return undefined;
 }
 
 export interface Session {
@@ -12,6 +34,8 @@ export interface Session {
   name: string;
   model: string;
   endpoint_url: string;
+  created_at?: string | number;
+  updated_at?: string | number;
 }
 
 export interface Document {
@@ -32,8 +56,13 @@ export class OdysseusClient {
 
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {};
-    if (this.token) {
+    if (!this.token) { return h; }
+    // `ody_` tokens are admin-created API tokens → Bearer auth.
+    // Anything else is a session-cookie token from username/password login.
+    if (this.token.startsWith("ody_")) {
       h["Authorization"] = `Bearer ${this.token}`;
+    } else {
+      h["Cookie"] = `${SESSION_COOKIE}=${this.token}`;
     }
     return h;
   }
@@ -41,6 +70,59 @@ export class OdysseusClient {
   async getAuthStatus(): Promise<AuthStatus> {
     const res = await this.request("GET", "/api/auth/status");
     return res as AuthStatus;
+  }
+
+  /**
+   * Log in with username/password. On success returns the session token
+   * (the value of the odysseus_session cookie) to store in VS Code secrets.
+   * If the account has 2FA, the first call returns { requiresTotp: true };
+   * call again with totpCode set.
+   */
+  async login(username: string, password: string, totpCode?: string): Promise<LoginResult> {
+    const payload: Record<string, unknown> = {
+      username: username.trim(),
+      password,
+      remember: true,
+    };
+    if (totpCode) { payload.totp_code = totpCode.trim(); }
+
+    let res: { status: number; body: string; setCookie?: string[] };
+    try {
+      res = await this.rawRequest("POST", "/api/auth/login", payload);
+    } catch (err) {
+      return { ok: false, error: `Cannot reach Odysseus: ${String(err)}` };
+    }
+
+    if (res.status === 429) {
+      return { ok: false, error: "Too many attempts — wait a minute and try again." };
+    }
+    if (res.status === 401) {
+      return { ok: false, error: parseErrorBody(res.body) || "Invalid username or password." };
+    }
+
+    let data: Record<string, unknown> = {};
+    try { data = JSON.parse(res.body); } catch { /* non-JSON */ }
+
+    if (res.status >= 400) {
+      return { ok: false, error: parseErrorBody(res.body) || `Login failed (HTTP ${res.status}).` };
+    }
+    if (data.requires_totp) {
+      return { ok: false, requiresTotp: true, username: String(data.username ?? username) };
+    }
+    if (!data.ok) {
+      return { ok: false, error: String(data.error ?? "Login failed.") };
+    }
+
+    const token = extractCookie(res.setCookie, SESSION_COOKIE);
+    if (!token) {
+      return { ok: false, error: "Login succeeded but no session cookie was returned." };
+    }
+    return { ok: true, token, username: String(data.username ?? username) };
+  }
+
+  /** Best-effort logout — revokes the session token on the server. */
+  async logout(): Promise<void> {
+    try { await this.request("POST", "/api/auth/logout"); } catch { /* ignore */ }
   }
 
   async resolveDefaultEndpoint(): Promise<{ url: string; model: string; endpointId?: string }> {
@@ -209,6 +291,55 @@ export class OdysseusClient {
     });
   }
 
+  /** Like request(), but resolves with status code, raw body, and Set-Cookie
+   *  instead of throwing on 4xx — used by login() to read the session cookie. */
+  private rawRequest(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<{ status: number; body: string; setCookie?: string[] }> {
+    return new Promise((resolve, reject) => {
+      const url = new URL(this.baseUrl + path);
+      const isHttps = url.protocol === "https:";
+      const lib = isHttps ? https : http;
+
+      const bodyStr = body !== undefined ? JSON.stringify(body) : undefined;
+      const headers: Record<string, string> = {
+        ...this.authHeaders(),
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      };
+      if (bodyStr) {
+        headers["Content-Length"] = Buffer.byteLength(bodyStr).toString();
+      }
+
+      const req = lib.request(
+        {
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname + url.search,
+          method,
+          headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const setCookie = res.headers["set-cookie"];
+            resolve({
+              status: res.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString(),
+              setCookie: Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : undefined,
+            });
+          });
+        }
+      );
+      req.on("error", reject);
+      if (bodyStr) { req.write(bodyStr); }
+      req.end();
+    });
+  }
+
   private request(
     method: string,
     path: string,
@@ -264,5 +395,15 @@ export class OdysseusClient {
 
   buildChatStreamUrl(): string {
     return `${this.baseUrl}/api/chat_stream`;
+  }
+}
+
+/** Pull a human-readable message out of a FastAPI error body ({"detail": "..."}). */
+function parseErrorBody(body: string): string | undefined {
+  try {
+    const j = JSON.parse(body);
+    return (j.detail ?? j.error ?? j.message) as string | undefined;
+  } catch {
+    return undefined;
   }
 }
