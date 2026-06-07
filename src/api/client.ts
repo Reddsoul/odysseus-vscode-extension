@@ -36,6 +36,7 @@ export interface Session {
   endpoint_url: string;
   created_at?: string | number;
   updated_at?: string | number;
+  is_important?: boolean;
 }
 
 export interface Document {
@@ -203,10 +204,8 @@ export class OdysseusClient {
 
   async getSessionMessages(id: string): Promise<Array<{ role: string; content: string; created_at?: string }>> {
     try {
-      const res = await this.request("GET", `/api/session/${id}/messages`);
-      return (res as { messages?: Array<{ role: string; content: string; created_at?: string }> }).messages
-        ?? (res as Array<{ role: string; content: string; created_at?: string }>)
-        ?? [];
+      const res = await this.request("GET", `/api/history/${id}`);
+      return (res as { history?: Array<{ role: string; content: string; created_at?: string }> }).history ?? [];
     } catch {
       return [];
     }
@@ -412,8 +411,133 @@ export class OdysseusClient {
     });
   }
 
+  async stopChat(sessionId: string): Promise<void> {
+    try { await this.request("POST", `/api/chat/stop/${sessionId}`); } catch { /* ignore */ }
+  }
+
+  async editMessage(sessionId: string, index: number, content: string): Promise<void> {
+    await this.requestForm("POST", `/api/session/${sessionId}/edit-message`, {
+      message_index: String(index), content,
+    });
+  }
+
+  async deleteMessages(sessionId: string, from: number, to: number): Promise<void> {
+    await this.requestForm("DELETE", `/api/session/${sessionId}/delete-messages`, {
+      from: String(from), to: String(to),
+    });
+  }
+
+  async markSessionImportant(id: string, important: boolean): Promise<void> {
+    await this.requestForm("POST", `/api/session/${id}/important`, { important: important ? "true" : "false" });
+  }
+
+  async compactSession(id: string): Promise<void> {
+    await this.requestForm("POST", `/api/session/${id}/compact`, {});
+  }
+
+  async forkSession(id: string, keepCount = 10): Promise<Session> {
+    const res = await this.requestForm("POST", `/api/session/${id}/fork`, { keep_count: String(keepCount) });
+    return res as Session;
+  }
+
+  async truncateSession(id: string, keepCount: number): Promise<void> {
+    await this.requestForm("POST", `/api/session/${id}/truncate`, { keep_count: String(keepCount) });
+  }
+
+  async getStreamStatus(sessionId: string): Promise<{ status: string; detached?: boolean } | null> {
+    try { return await this.request("GET", `/api/chat/stream_status/${sessionId}`) as { status: string; detached?: boolean }; }
+    catch { return null; }
+  }
+
+  async searchMessages(q: string, limit = 20): Promise<Array<{ session_id: string; session_name: string; role: string; content_snippet: string; timestamp?: string }>> {
+    try {
+      const res = await this.request("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+      return res as Array<{ session_id: string; session_name: string; role: string; content_snippet: string; timestamp?: string }>;
+    } catch { return []; }
+  }
+
+  async listPresets(): Promise<Array<{ id: string; name: string; character_name?: string }>> {
+    try { return (await this.request("GET", "/api/presets")) as Array<{ id: string; name: string; character_name?: string }>; }
+    catch { return []; }
+  }
+
   buildChatStreamUrl(): string {
     return `${this.baseUrl}/api/chat_stream`;
+  }
+
+  async listMemories(): Promise<Array<{ id: string; text: string; category: string; timestamp: string; source?: string }>> {
+    try { return ((await this.request("GET", "/api/memory")) as { memory: Array<{ id: string; text: string; category: string; timestamp: string }> }).memory ?? []; }
+    catch { return []; }
+  }
+
+  async addMemory(text: string, category: string): Promise<void> {
+    await this.requestForm("POST", "/api/memory/add", { text, category });
+  }
+
+  async deleteMemory(id: string): Promise<void> {
+    await this.request("DELETE", `/api/memory/${id}`);
+  }
+
+  async listNotes(): Promise<Note[]> {
+    try { return (await this.request("GET", "/api/notes")) as Note[]; }
+    catch { return []; }
+  }
+
+  async createNote(title: string, content: string, noteType = "note"): Promise<Note> {
+    return (await this.request("POST", "/api/notes", { title, content, note_type: noteType })) as Note;
+  }
+
+  async deleteNote(id: string): Promise<void> {
+    await this.request("DELETE", `/api/notes/${id}`);
+  }
+
+  async toggleTodoItem(noteId: string, index: number): Promise<void> {
+    await this.request("POST", `/api/notes/${noteId}/items/${index}/toggle`);
+  }
+
+  async startResearch(query: string, sessionId?: string): Promise<{ session_id: string; task_id?: string }> {
+    return (await this.requestForm("POST", "/api/research/start", {
+      query,
+      ...(sessionId ? { session_id: sessionId } : {}),
+    })) as { session_id: string };
+  }
+
+  async getResearchReport(researchSessionId: string): Promise<{ report: string; sources: Array<{ url: string; title?: string }> }> {
+    return (await this.request("GET", `/api/research/report/${researchSessionId}`)) as { report: string; sources: Array<{ url: string; title?: string }> };
+  }
+
+  async uploadFile(filename: string, content: Buffer, mimeType: string): Promise<{ id: string; filename: string; url: string }> {
+    const boundary = `----OdysseusBoundary${Date.now()}`;
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`;
+    const footer = `\r\n--${boundary}--\r\n`;
+    const body = Buffer.concat([Buffer.from(header), content, Buffer.from(footer)]);
+    return new Promise((resolve, reject) => {
+      const url = new URL(this.baseUrl + "/api/upload");
+      const isHttps = url.protocol === "https:";
+      const lib = isHttps ? https : http;
+      const req = lib.request({
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          ...this.authHeaders(),
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": body.length,
+        },
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString();
+          if (!res.statusCode || res.statusCode >= 400) { reject(new Error(`HTTP ${res.statusCode}: ${raw}`)); return; }
+          try { resolve(JSON.parse(raw)); } catch { reject(new Error("Invalid response")); }
+        });
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
   }
 }
 
@@ -425,4 +549,14 @@ function parseErrorBody(body: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+export interface Note {
+  id: string;
+  title?: string;
+  content?: string;
+  note_type: string;
+  pinned?: boolean;
+  color?: string;
+  items?: Array<{ text: string; done: boolean }>;
 }

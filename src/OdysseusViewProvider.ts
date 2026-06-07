@@ -10,6 +10,7 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private client?: OdysseusClient;
   private state: SidebarState = "loading";
+  private lastSessionRefresh = 0;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     // When the chat panel closes, refresh the history list.
@@ -36,8 +37,11 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Re-fetch sessions and push them to the sidebar (when in ready state). */
-  private async refreshSessions(): Promise<void> {
+  private async refreshSessions(force = false): Promise<void> {
     if (this.state !== "ready" || !this.client || !this.view) { return; }
+    const now = Date.now();
+    if (!force && now - this.lastSessionRefresh < 5000) { return; }
+    this.lastSessionRefresh = now;
     const sessions = await this.client.listSessions();
     this.postMessage({ type: "sessionsLoaded", sessions });
   }
@@ -97,6 +101,9 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case "newSession": {
         const existing = ChatPanel.getCurrent();
+        if (!existing) {
+          await this.context.workspaceState.update("odysseus.sessionId", undefined);
+        }
         const panel = ChatPanel.createOrShow(this.context);
         if (existing) { await panel.newSession(); }
         break;
@@ -115,7 +122,7 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
         await this.init();
         break;
       case "requestSessions":
-        await this.refreshSessions();
+        await this.refreshSessions(true);
         break;
       case "openSession": {
         const id = String(msg.sessionId ?? "");
@@ -146,6 +153,31 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
         if (choice !== "Yes, delete") { break; }
         await this.client.deleteSession(id);
         await this.refreshSessions();
+        break;
+      }
+      case "starSession": {
+        const id = String(msg.sessionId ?? "");
+        if (!id || !this.client) { break; }
+        await this.client.markSessionImportant(id, Boolean(msg.important));
+        await this.refreshSessions(true);
+        break;
+      }
+      case "compactSession": {
+        const id = String(msg.sessionId ?? "");
+        if (!id || !this.client) { break; }
+        vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Compacting session…" }, async () => {
+          await this.client!.compactSession(id);
+          await this.refreshSessions(true);
+          vscode.window.showInformationMessage("Session compacted.");
+        });
+        break;
+      }
+      case "forkSession": {
+        const id = String(msg.sessionId ?? "");
+        if (!id || !this.client) { break; }
+        const forked = await this.client.forkSession(id);
+        ChatPanel.createOrShow(this.context, forked.id);
+        await this.refreshSessions(true);
         break;
       }
     }
@@ -317,7 +349,7 @@ body.ready {
 .search-input:focus { border-color: var(--vscode-focusBorder); }
 .search-icon {
   position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
-  opacity: 0.45; font-size: 11px; pointer-events: none;
+  opacity: 0.45; pointer-events: none; display: flex; align-items: center;
 }
 .divider { height: 1px; background: var(--vscode-editorWidget-border, rgba(255,255,255,0.08)); margin: 0; }
 
@@ -420,7 +452,7 @@ ${state === "ready" ? `
   <div class="ready-top">
     <button class="new-chat-btn" id="new-chat">+ New Chat</button>
     <div class="search-row">
-      <span class="search-icon">🔍</span>
+      <span class="search-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
       <input class="search-input" id="session-search" type="text" placeholder="Search sessions" autocomplete="off" spellcheck="false">
     </div>
   </div>
@@ -429,8 +461,8 @@ ${state === "ready" ? `
     <div class="session-empty">Loading sessions…</div>
   </div>
   <div class="footer">
-    <button class="footer-btn" id="configure-btn">⚙ Configure</button>
-    <button class="footer-btn" id="signout-btn">↩ Sign out</button>
+    <button class="footer-btn" id="configure-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Configure</button>
+    <button class="footer-btn" id="signout-btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</button>
   </div>
 </div>
 ` : ""}
@@ -543,7 +575,11 @@ function renderSessions(query) {
   const q = (query || '').toLowerCase();
   const filtered = allSessions
     .filter(s => !q || (s.name || '').toLowerCase().includes(q))
-    .sort((a, b) => sessionTime(b) - sessionTime(a));
+    .sort((a, b) => {
+      if (a.is_important && !b.is_important) return -1;
+      if (!a.is_important && b.is_important) return 1;
+      return sessionTime(b) - sessionTime(a);
+    });
 
   if (!filtered.length) {
     sessionList.innerHTML = '<div class="session-empty">' +
@@ -567,6 +603,9 @@ function renderSessions(query) {
         '<span class="session-name">' + escHtml(s.name || 'Untitled') + '</span>' +
         '<span class="session-time">' + escHtml(relTime(sessionTime(s))) + '</span>' +
         '<span class="session-actions">' +
+          '<button class="session-action-btn star-btn" data-id="' + escHtml(s.id) + '" data-important="' + (s.is_important ? '1' : '0') + '" title="Star">' + (s.is_important ? '★' : '☆') + '</button>' +
+          '<button class="session-action-btn compact-btn" data-id="' + escHtml(s.id) + '" title="Compact">⚡</button>' +
+          '<button class="session-action-btn fork-btn" data-id="' + escHtml(s.id) + '" title="Fork">⑂</button>' +
           '<button class="session-action-btn rename-btn" data-id="' + escHtml(s.id) + '" title="Rename">✏</button>' +
           '<button class="session-action-btn delete-btn" data-id="' + escHtml(s.id) + '" title="Delete">🗑</button>' +
         '</span>' +
@@ -586,6 +625,24 @@ function renderSessions(query) {
           vscode.postMessage({ type: 'openSession', sessionId: el.dataset.id });
         }
       }
+    });
+  });
+  sessionList.querySelectorAll('.star-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'starSession', sessionId: btn.dataset.id, important: btn.dataset.important !== '1' });
+    });
+  });
+  sessionList.querySelectorAll('.compact-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'compactSession', sessionId: btn.dataset.id });
+    });
+  });
+  sessionList.querySelectorAll('.fork-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'forkSession', sessionId: btn.dataset.id });
     });
   });
   sessionList.querySelectorAll('.rename-btn').forEach(btn => {

@@ -32,7 +32,7 @@
       },
       {
         "command": "odysseus.sendSelection",
-        "title": "Send Selection to Chat",
+        "title": "Send Selection to Odysseus",
         "category": "Odysseus"
       },
       {
@@ -44,6 +44,11 @@
         "command": "odysseus.openNewChat",
         "title": "Open New Chat Panel",
         "category": "Odysseus"
+      },
+      {
+        "command": "odysseus.searchMessages",
+        "title": "Search Messages",
+        "category": "Odysseus"
       }
     ],
     "keybindings": [
@@ -52,8 +57,33 @@
         "key": "alt+k",
         "mac": "alt+k",
         "when": "editorFocus"
+      },
+      {
+        "command": "odysseus.openChat",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o"
+      },
+      {
+        "command": "odysseus.searchMessages",
+        "key": "ctrl+shift+f",
+        "mac": "cmd+shift+f",
+        "when": "false"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "odysseus.sendSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@99"
+        },
+        {
+          "command": "odysseus.insertAtMention",
+          "when": "editorHasSelection",
+          "group": "navigation@100"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -99,6 +129,16 @@
           "type": "webview",
           "id": "odysseus.chatView",
           "name": "Odysseus AI"
+        },
+        {
+          "type": "webview",
+          "id": "odysseus.memoryView",
+          "name": "Memories"
+        },
+        {
+          "type": "webview",
+          "id": "odysseus.notesView",
+          "name": "Notes"
         }
       ]
     }
@@ -108,7 +148,9 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
+    "@types/node": "^25.9.2",
     "@types/vscode": "^1.85.0",
+    "marked": "^18.0.5",
     "typescript": "^5.0.0"
   }
 }

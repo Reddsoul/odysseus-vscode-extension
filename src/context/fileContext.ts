@@ -109,7 +109,11 @@ export async function buildApiMessage(
     // List workspace files respecting .gitignore via findFiles
     try {
       const pattern = new vscode.RelativePattern(workspaceRoot, "**/*");
-      const uris = await vscode.workspace.findFiles(pattern, "**/node_modules/**", 60);
+      const uris = await vscode.workspace.findFiles(
+        pattern,
+        "{**/node_modules/**,**/out/**,**/dist/**,**/build/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/*.pyo,**/*.map}",
+        60
+      );
       const relPaths = uris.map(u => vscode.workspace.asRelativePath(u, false)).sort();
       lines.push(`files: ${relPaths.slice(0, 60).join(", ")}`);
     } catch { /* ignore */ }
