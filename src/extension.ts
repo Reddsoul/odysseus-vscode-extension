@@ -9,7 +9,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerWebviewViewProvider(
       OdysseusViewProvider.viewId,
       provider,
-      { webviewOptions: { retainContextWhenHidden: false } }
+      { webviewOptions: { retainContextWhenHidden: true } }
     )
   );
 
@@ -39,6 +39,43 @@ export function activate(context: vscode.ExtensionContext): void {
       } else {
         ChatPanel.createOrShow(context).sendSelection();
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("odysseus.insertAtMention", () => {
+      const panel = ChatPanel.getCurrent();
+      if (!panel) { return; }
+      panel.insertAtMention();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("odysseus.openNewChat", () => {
+      ChatPanel.createNewPanel(context);
+    })
+  );
+
+  // Register content provider for pre-edit snapshots (diff viewer)
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("odysseus-original", {
+      provideTextDocumentContent(uri) {
+        return ChatPanel.getPreEditSnapshotFromAny(uri.path) ?? "";
+      },
+    })
+  );
+
+  // URI handler: vscode://JoseAlma.odysseus-vscode-extension/open?prompt=...
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri(uri: vscode.Uri) {
+        const params = new URLSearchParams(uri.query);
+        const prompt = params.get("prompt") ?? "";
+        const panel = ChatPanel.createOrShow(context);
+        if (prompt) {
+          panel.prefillPrompt(decodeURIComponent(prompt));
+        }
+      },
     })
   );
 }

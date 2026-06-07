@@ -193,6 +193,25 @@ export class OdysseusClient {
     }
   }
 
+  async renameSession(id: string, name: string): Promise<void> {
+    await this.requestForm("PATCH", `/api/session/${id}`, { name });
+  }
+
+  async deleteSession(id: string): Promise<void> {
+    await this.request("DELETE", `/api/session/${id}`);
+  }
+
+  async getSessionMessages(id: string): Promise<Array<{ role: string; content: string; created_at?: string }>> {
+    try {
+      const res = await this.request("GET", `/api/session/${id}/messages`);
+      return (res as { messages?: Array<{ role: string; content: string; created_at?: string }> }).messages
+        ?? (res as Array<{ role: string; content: string; created_at?: string }>)
+        ?? [];
+    } catch {
+      return [];
+    }
+  }
+
   async updateSessionModel(id: string, model: string, endpointUrl: string): Promise<void> {
     await this.requestForm("PATCH", `/api/session/${id}`, {
       model,

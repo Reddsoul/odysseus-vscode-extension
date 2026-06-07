@@ -128,6 +128,26 @@ export class OdysseusViewProvider implements vscode.WebviewViewProvider {
       case "signOut":
         await this.signOut();
         break;
+      case "renameSession": {
+        const id = String(msg.sessionId ?? "");
+        if (!id || !this.client) { break; }
+        const name = await vscode.window.showInputBox({ prompt: "New session name", placeHolder: "Session name" });
+        if (name === undefined || !name.trim()) { break; }
+        await this.client.renameSession(id, name.trim());
+        await this.refreshSessions();
+        break;
+      }
+      case "deleteSession": {
+        const id = String(msg.sessionId ?? "");
+        if (!id || !this.client) { break; }
+        const choice = await vscode.window.showQuickPick(["Yes, delete", "Cancel"], {
+          placeHolder: "Delete this session?",
+        });
+        if (choice !== "Yes, delete") { break; }
+        await this.client.deleteSession(id);
+        await this.refreshSessions();
+        break;
+      }
     }
   }
 
@@ -334,6 +354,20 @@ body.ready {
 }
 .session-time { font-size: 10px; opacity: 0.45; flex-shrink: 0; }
 .session-empty { padding: 16px 10px; font-size: 11px; opacity: 0.5; text-align: center; }
+.session-actions { display: none; gap: 2px; flex-shrink: 0; }
+.session-row:hover .session-actions { display: flex; }
+.session-action-btn {
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: inherit;
+  border: none;
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0.55;
+}
+.session-action-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }
 
 .footer {
   display: flex;
@@ -529,15 +563,42 @@ function renderSessions(query) {
     if (!rows || !rows.length) continue;
     html += '<div class="session-group-label">' + g + '</div>';
     for (const s of rows) {
-      html += '<button class="session-row" data-id="' + escHtml(s.id) + '">' +
+      html += '<div class="session-row" role="button" tabindex="0" data-id="' + escHtml(s.id) + '">' +
         '<span class="session-name">' + escHtml(s.name || 'Untitled') + '</span>' +
         '<span class="session-time">' + escHtml(relTime(sessionTime(s))) + '</span>' +
-      '</button>';
+        '<span class="session-actions">' +
+          '<button class="session-action-btn rename-btn" data-id="' + escHtml(s.id) + '" title="Rename">✏</button>' +
+          '<button class="session-action-btn delete-btn" data-id="' + escHtml(s.id) + '" title="Delete">🗑</button>' +
+        '</span>' +
+      '</div>';
     }
   }
   sessionList.innerHTML = html;
   sessionList.querySelectorAll('.session-row').forEach(el => {
-    el.addEventListener('click', () => vscode.postMessage({ type: 'openSession', sessionId: el.dataset.id }));
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.session-actions')) return;
+      vscode.postMessage({ type: 'openSession', sessionId: el.dataset.id });
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        if (!e.target.closest('.session-actions')) {
+          vscode.postMessage({ type: 'openSession', sessionId: el.dataset.id });
+        }
+      }
+    });
+  });
+  sessionList.querySelectorAll('.rename-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'renameSession', sessionId: btn.dataset.id });
+    });
+  });
+  sessionList.querySelectorAll('.delete-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'deleteSession', sessionId: btn.dataset.id });
+    });
   });
 }
 

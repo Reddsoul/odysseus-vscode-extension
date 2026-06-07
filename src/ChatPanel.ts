@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { OdysseusClient } from "./api/client";
 import { streamChat } from "./api/streaming";
 import { DocSync } from "./sync/docSync";
@@ -12,44 +13,54 @@ import {
 
 export class ChatPanel {
   public static readonly viewType = "odysseus.chatPanel";
-  private static instance: ChatPanel | undefined;
+  private static instances = new Set<ChatPanel>();
+  private static _lastFocused: ChatPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private client?: OdysseusClient;
   private docSync?: DocSync;
   private sessionId?: string;
-  private currentFilePath?: string;
-  private currentFileContent?: string;
   private currentModel = "";
   private currentEndpointUrl = "";
   private disposables: vscode.Disposable[] = [];
   private pendingSessionId?: string;
+  private contextUpdateTimer?: NodeJS.Timeout;
+  private lastKnownFileCtx?: ReturnType<typeof getActiveFileContext>;
+  private freshSession = false;
+  private preEditSnapshots = new Map<string, string>();
 
   /** Called when the chat panel is disposed, so the sidebar can refresh its list. */
   public static onDidClose?: () => void;
 
   public static createOrShow(context: vscode.ExtensionContext, sessionId?: string): ChatPanel {
-    if (ChatPanel.instance) {
-      ChatPanel.instance.panel.reveal(vscode.ViewColumn.Beside, true);
-      if (sessionId) { ChatPanel.instance.loadSession(sessionId); }
-      return ChatPanel.instance;
+    // If a specific session is requested and already open, focus it
+    if (sessionId) {
+      for (const existing of ChatPanel.instances) {
+        if (existing.sessionId === sessionId) {
+          existing.panel.reveal(vscode.ViewColumn.Beside, true);
+          return existing;
+        }
+      }
     }
-    const panel = vscode.window.createWebviewPanel(
+    // If no sessionId and there's already a focused panel, just reveal it
+    if (!sessionId && ChatPanel._lastFocused) {
+      ChatPanel._lastFocused.panel.reveal(vscode.ViewColumn.Beside, true);
+      return ChatPanel._lastFocused;
+    }
+    const webviewPanel = vscode.window.createWebviewPanel(
       ChatPanel.viewType,
       "Odysseus",
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [],
-      }
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [] }
     );
-    ChatPanel.instance = new ChatPanel(panel, context, sessionId);
-    return ChatPanel.instance;
+    const instance = new ChatPanel(webviewPanel, context, sessionId);
+    ChatPanel.instances.add(instance);
+    ChatPanel._lastFocused = instance;
+    return instance;
   }
 
   public static getCurrent(): ChatPanel | undefined {
-    return ChatPanel.instance;
+    return ChatPanel._lastFocused;
   }
 
   private constructor(
@@ -67,8 +78,22 @@ export class ChatPanel {
     );
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.onDidChangeViewState(({ webviewPanel }) => {
+      if (webviewPanel.active) { ChatPanel._lastFocused = this; }
+    }, null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (msg) => this.handleMessage(msg),
+      null,
+      this.disposables
+    );
+
+    vscode.window.onDidChangeActiveTextEditor(
+      () => this.sendContextUpdate(),
+      null,
+      this.disposables
+    );
+    vscode.window.onDidChangeTextEditorSelection(
+      () => this.scheduleContextUpdate(),
       null,
       this.disposables
     );
@@ -78,11 +103,43 @@ export class ChatPanel {
   }
 
   private dispose(): void {
-    ChatPanel.instance = undefined;
+    if (this.contextUpdateTimer) { clearTimeout(this.contextUpdateTimer); }
+    ChatPanel.instances.delete(this);
+    if (ChatPanel._lastFocused === this) {
+      // Pick any remaining instance as the focused one
+      ChatPanel._lastFocused = ChatPanel.instances.values().next().value;
+    }
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables = [];
     ChatPanel.onDidClose?.();
+  }
+
+  private sendContextUpdate(): void {
+    const fileCtx = getActiveFileContext();
+    const selCtx  = getSelectionContext();
+    // Only update lastKnownFileCtx when a real editor is focused — clicking into
+    // the webview sets activeTextEditor to undefined, which should not clear the pill.
+    if (fileCtx) { this.lastKnownFileCtx = fileCtx; }
+    const displayFile = this.lastKnownFileCtx;
+    this.postMessage({
+      type: "contextUpdate",
+      file: displayFile ? {
+        name: displayFile.filePath.split("/").pop() ?? displayFile.filePath,
+        path: displayFile.filePath,
+        language: displayFile.language,
+      } : null,
+      selection: selCtx ? {
+        startLine: selCtx.startLine,
+        endLine: selCtx.endLine,
+        language: selCtx.language,
+      } : null,
+    });
+  }
+
+  private scheduleContextUpdate(): void {
+    if (this.contextUpdateTimer) { clearTimeout(this.contextUpdateTimer); }
+    this.contextUpdateTimer = setTimeout(() => this.sendContextUpdate(), 150);
   }
 
   private getUrl(): string {
@@ -118,6 +175,7 @@ export class ChatPanel {
     // Also send immediately after a short delay — postMessage may drop if webview isn't ready yet
     setTimeout(() => this.sendModelsToWebview(), 300);
     setTimeout(() => this.sendModelsToWebview(), 1000);
+    setTimeout(() => this.sendContextUpdate(), 600);
   }
 
   /** Switch the panel to an existing session (from the history sidebar). */
@@ -126,9 +184,24 @@ export class ChatPanel {
     this.pendingSessionId = sessionId;
     this.docSync?.reset();
     await this.ensureSession();
-    // No message-history endpoint on the backend, so reset the view to the
-    // chosen session rather than replaying past messages.
     this.postMessage({ type: "clearMessages" });
+
+    // Resolve human-readable name upfront for fallback divider
+    const session = await this.client.getSession(sessionId).catch(() => null);
+    const sessionName = session?.name ?? "session";
+
+    // Try to load message history from backend
+    try {
+      const messages = await this.client.getSessionMessages(sessionId);
+      if (messages.length > 0) {
+        this.postMessage({ type: "loadHistory", messages });
+      } else {
+        this.postMessage({ type: "sessionSwitched", sessionName });
+      }
+    } catch {
+      this.postMessage({ type: "sessionSwitched", sessionName });
+    }
+
     this.panel.reveal(vscode.ViewColumn.Beside, true);
   }
 
@@ -174,11 +247,72 @@ export class ChatPanel {
 
   async newSession(): Promise<void> {
     if (!this.client) { return; }
+    this.sessionId = undefined;
     await this.context.workspaceState.update("odysseus.sessionId", undefined);
     this.docSync?.reset();
-    await this.ensureSession();
+    await this.createFreshSession();
     this.postMessage({ type: "clearMessages" });
-    vscode.window.showInformationMessage("Odysseus: new session started");
+  }
+
+  private async createFreshSession(): Promise<void> {
+    if (!this.client) { return; }
+    const folderName = vscode.workspace.workspaceFolders?.[0]?.name ?? "VS Code";
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const name = `${folderName} (VS Code) ${ts}`;
+    const session = await this.client.createSession(
+      name,
+      this.currentModel || undefined,
+      this.currentEndpointUrl || undefined
+    );
+    console.log(`[Odysseus] createFreshSession: name="${name}" → id=${session.id}`);
+    this.freshSession = true;
+    this.sessionId = session.id;
+    if (session.model)        { this.currentModel = session.model; }
+    if (session.endpoint_url) { this.currentEndpointUrl = session.endpoint_url; }
+    await this.context.workspaceState.update("odysseus.sessionId", session.id);
+  }
+
+  prefillPrompt(text: string): void {
+    this.postMessage({ type: "prefillPrompt", text });
+  }
+
+  getPreEditSnapshot(filePath: string): string | undefined {
+    return this.preEditSnapshots.get(filePath);
+  }
+
+  /** Search all open panels for a pre-edit snapshot — used by the content provider. */
+  public static getPreEditSnapshotFromAny(filePath: string): string | undefined {
+    for (const instance of ChatPanel.instances) {
+      const snap = instance.getPreEditSnapshot(filePath);
+      if (snap !== undefined) { return snap; }
+    }
+    return undefined;
+  }
+
+  /** Always creates a fresh panel regardless of existing instances. */
+  public static createNewPanel(context: vscode.ExtensionContext): ChatPanel {
+    const webviewPanel = vscode.window.createWebviewPanel(
+      ChatPanel.viewType,
+      "Odysseus",
+      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [] }
+    );
+    const instance = new ChatPanel(webviewPanel, context, undefined);
+    ChatPanel.instances.add(instance);
+    ChatPanel._lastFocused = instance;
+    return instance;
+  }
+
+  insertAtMention(): void {
+    const fileCtx = getActiveFileContext() ?? this.lastKnownFileCtx;
+    if (!fileCtx) { return; }
+    const basename = fileCtx.filePath.split("/").pop() ?? fileCtx.filePath;
+    const sel = getSelectionContext();
+    const ref = sel
+      ? `@${basename}:${sel.startLine}-${sel.endLine}`
+      : `@${basename}`;
+    this.panel.reveal(vscode.ViewColumn.Beside, true);
+    this.postMessage({ type: "insertAtMention", ref });
   }
 
   async sendSelection(): Promise<void> {
@@ -188,7 +322,14 @@ export class ChatPanel {
       return;
     }
     this.panel.reveal(vscode.ViewColumn.Beside, true);
-    this.postMessage({ type: "prefillSelection", text: sel.text, language: sel.language });
+    this.postMessage({
+      type: "prefillSelection",
+      filePath: sel.filePath ?? "",
+      startLine: sel.startLine,
+      endLine: sel.endLine,
+      language: sel.language,
+      text: sel.text,
+    });
   }
 
   private async sendModelsToWebview(): Promise<void> {
@@ -214,6 +355,9 @@ export class ChatPanel {
       case "requestModels": await this.sendModelsToWebview(); break;
       case "selectModel": await this.handleSelectModel(String(msg.model ?? ""), String(msg.endpointUrl ?? "")); break;
       case "newSession":  await this.newSession(); break;
+      case "requestFiles": await this.handleRequestFiles(String(msg.query ?? "")); break;
+      case "revertEdit":  await this.handleRevertEdit(String(msg.path ?? "")); break;
+      case "viewDiff":    await this.handleViewDiff(String(msg.path ?? "")); break;
       case "retry":       await this.init(); break;
       case "login":       await this.handleLogin(String(msg.username ?? ""), String(msg.password ?? ""), String(msg.totp ?? "")); break;
       case "setUrl":      await this.handleSetUrl(String(msg.url ?? "")); break;
@@ -261,6 +405,59 @@ export class ChatPanel {
     setTimeout(() => this.sendModelsToWebview(), 1000);
   }
 
+  private async handleRevertEdit(filePath: string): Promise<void> {
+    if (!filePath) { return; }
+    const original = this.preEditSnapshots.get(filePath);
+    if (original === undefined) {
+      vscode.window.showWarningMessage("Odysseus: no pre-edit snapshot for this file.");
+      return;
+    }
+    try {
+      await vscode.workspace.fs.writeFile(
+        vscode.Uri.file(filePath),
+        Buffer.from(original, "utf-8")
+      );
+    } catch (err) {
+      vscode.window.showErrorMessage(`Odysseus: revert failed — ${String(err)}`);
+    }
+  }
+
+  private async handleViewDiff(filePath: string): Promise<void> {
+    if (!filePath || !this.preEditSnapshots.has(filePath)) { return; }
+    const basename = filePath.split("/").pop() ?? filePath;
+    const originalUri = vscode.Uri.parse(`odysseus-original:${filePath}`);
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      originalUri,
+      vscode.Uri.file(filePath),
+      `Odysseus: ${basename} (original ↔ modified)`,
+      { preview: true }
+    );
+  }
+
+  private async handleRequestFiles(query: string): Promise<void> {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      this.postMessage({ type: "filesResult", files: [] });
+      return;
+    }
+    const pattern = new vscode.RelativePattern(workspaceRoot, "**/*");
+    const uris = await vscode.workspace.findFiles(pattern, "**/node_modules/**", 30);
+    const q = query.toLowerCase();
+    const files = uris
+      .filter(u => {
+        const name = u.fsPath.split("/").pop() ?? "";
+        return !q || name.toLowerCase().includes(q);
+      })
+      .slice(0, 20)
+      .map(u => ({
+        name: u.fsPath.split("/").pop() ?? "",
+        path: u.fsPath,
+        relativePath: vscode.workspace.asRelativePath(u, false),
+      }));
+    this.postMessage({ type: "filesResult", files });
+  }
+
   private async handleSend(text: string, opts: SendOpts = {}): Promise<void> {
     if (!text.trim() || !this.client || !this.sessionId || !this.docSync) { return; }
 
@@ -271,12 +468,36 @@ export class ChatPanel {
     const allowBash      = opts.allowBash      ?? cfg.get<boolean>("allowBash", true);
     const allowWebSearch = opts.allowWebSearch ?? cfg.get<boolean>("allowWebSearch", true);
 
-    const fileCtx = getActiveFileContext();
-    const selCtx  = getSelectionContext();
+    await vscode.workspace.saveAll(false); // save dirty docs so agent reads fresh disk content
+
+    const fileCtx = opts.includeFile !== false ? (getActiveFileContext() ?? this.lastKnownFileCtx ?? null) : null;
+
+    // Snapshot files before agent runs so we can show diffs afterward
+    this.preEditSnapshots.clear();
+    if (fileCtx) {
+      try {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(fileCtx.filePath));
+        this.preEditSnapshots.set(fileCtx.filePath, Buffer.from(bytes).toString("utf-8"));
+      } catch { /* new file or unreadable */ }
+    }
+    const selCtx  = opts.includeSelection !== false ? getSelectionContext() : null;
     const workspaceRoot = getWorkspaceRoot();
 
     const displayMessage = buildDisplayMessage(text, selCtx);
-    const apiMessage     = buildApiMessage(displayMessage, workspaceRoot, fileCtx);
+    const isFresh = this.freshSession;
+    this.freshSession = false;
+    let apiMessage = await buildApiMessage(displayMessage, workspaceRoot, fileCtx, isFresh);
+
+    // Resolve @-mention tokens → inject file contents into the API message
+    const atMentions = [...text.matchAll(/@([\w./\-]+)/g)].map(m => m[1]);
+    for (const ref of atMentions) {
+      const absPath = workspaceRoot ? path.resolve(workspaceRoot, ref) : ref;
+      try {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(absPath));
+        const content = Buffer.from(bytes).toString("utf-8").slice(0, 10000);
+        apiMessage += `\n<referenced_file path="${ref}">\n${content}\n</referenced_file>`;
+      } catch { /* file not found or unreadable — skip */ }
+    }
 
     this.postMessage({ type: "userMessage", text: displayMessage });
     this.postMessage({ type: "assistantStart" });
@@ -308,12 +529,11 @@ export class ChatPanel {
 
     this.postMessage({ type: "assistantDone" });
 
-    // Refresh any files the agent wrote to disk
+    // Refresh any files the agent wrote to disk, show diff for modified files
     for (const p of writtenPaths) {
       try {
         const uri = vscode.Uri.file(p);
         const doc = await vscode.workspace.openTextDocument(uri);
-        // If already open in an editor, revert to pick up disk changes
         const editor = vscode.window.visibleTextEditors.find(
           (e) => e.document.uri.fsPath === p
         );
@@ -321,6 +541,19 @@ export class ChatPanel {
           await vscode.commands.executeCommand("workbench.action.files.revert");
         } else {
           await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true });
+        }
+        // Show diff if we have a pre-edit snapshot for this file
+        if (this.preEditSnapshots.has(p)) {
+          const basename = p.split("/").pop() ?? p;
+          const originalUri = vscode.Uri.parse(`odysseus-original:${p}`);
+          await vscode.commands.executeCommand(
+            "vscode.diff",
+            originalUri,
+            uri,
+            `Odysseus: ${basename} (original ↔ modified)`,
+            { preview: true }
+          );
+          this.postMessage({ type: "editProposed", path: p });
         }
       } catch { /* file may not exist yet or path is outside workspace */ }
     }
@@ -330,7 +563,14 @@ export class ChatPanel {
     this.panel.webview.postMessage(msg);
   }
 
+  private getUseCtrlEnter(): boolean {
+    return vscode.workspace
+      .getConfiguration("odysseus")
+      .get<boolean>("useCtrlEnterToSend", false);
+  }
+
   private buildHtml(state: "loading" | "disconnected" | "auth" | "chat", initialModel?: string): string {
+    const useCtrlEnter = this.getUseCtrlEnter();
     const nonce = generateNonce();
     return `<!DOCTYPE html>
 <html lang="en">
@@ -624,6 +864,48 @@ body.verbose .chat-header { display: flex; }
 .cursor::after { content: "▌"; animation: blink 1s step-end infinite; opacity: 0.7; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ── Context pills ─────────────────────────────── */
+.context-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 12px 0;
+  min-height: 0;
+}
+.context-pills:empty { padding: 0; }
+.context-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(224,108,117,0.3);
+  background: rgba(224,108,117,0.08);
+  font-size: 11px;
+  color: var(--vscode-foreground);
+  max-width: 240px;
+}
+.context-pill-icon { opacity: 0.65; flex-shrink: 0; }
+.context-pill-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.context-pill-close {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.4;
+  cursor: pointer;
+  padding: 0 3px;
+  border: none;
+  background: none;
+  color: inherit;
+  flex-shrink: 0;
+}
+.context-pill-close:hover { opacity: 1; }
+
 /* ── Chat input bar (matches Odysseus) ─────────── */
 .chat-input-bar {
   margin: 0 16px 4px;
@@ -830,6 +1112,105 @@ body.verbose .chat-header { display: flex; }
   margin-top: 6px;
   opacity: 0.8;
 }
+
+/* ── @-mention picker ───────────────────────────── */
+.at-picker {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.15));
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  z-index: 200;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.at-picker.open { display: flex; }
+.at-picker-item {
+  padding: 7px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.at-picker-item:hover, .at-picker-item.kb-active { background: var(--vscode-list-hoverBackground); }
+.at-picker-rel { font-size: 10px; opacity: 0.45; }
+
+/* ── Slash command menu ─────────────────────────── */
+.slash-menu {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.15));
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  z-index: 200;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.slash-menu.open { display: flex; }
+.slash-menu-item {
+  padding: 8px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.slash-menu-item:hover, .slash-menu-item.kb-active { background: var(--vscode-list-hoverBackground); }
+.slash-cmd { font-weight: 600; font-family: var(--vscode-editor-font-family, monospace); }
+.slash-desc { font-size: 11px; opacity: 0.55; }
+
+/* ── Edit proposal bar ──────────────────────────── */
+.edit-proposal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(224,108,117,0.08);
+  border: 1px solid rgba(224,108,117,0.25);
+  border-radius: 6px;
+  font-size: 11px;
+  margin: 4px 0;
+  flex-wrap: wrap;
+}
+.edit-proposal-name { font-family: var(--vscode-editor-font-family, monospace); flex: 1; }
+.edit-proposal-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.15));
+  background: var(--vscode-editorWidget-background);
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+.edit-proposal-btn:hover { background: var(--vscode-list-hoverBackground); }
+
+/* ── Context indicator ──────────────────────────── */
+.context-indicator {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 20px;
+  font-size: 11px;
+  opacity: 0.55;
+  border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(255,255,255,0.06));
+  font-variant-numeric: tabular-nums;
+}
+.context-indicator.visible { display: flex; }
 </style>
 </head>
 <body>
@@ -864,10 +1245,16 @@ ${state === "chat" ? `
   <div class="chat-header" id="chat-header">
     <span id="reasoning-count">0 tool calls · 0 thinking blocks</span>
   </div>
+  <div class="context-indicator" id="context-indicator">
+    <span id="context-token-est">~0 tokens used</span>
+  </div>
   <div id="messages"></div>
 
   <div class="chat-input-bar">
-    <div class="chat-input-top">
+    <div class="context-pills" id="context-pills"></div>
+    <div class="chat-input-top" style="position:relative;">
+      <div class="at-picker" id="at-picker"></div>
+      <div class="slash-menu" id="slash-menu"></div>
       <textarea id="message" placeholder="Message Odysseus…" rows="1" autocomplete="off" spellcheck="false"></textarea>
       <div class="model-picker-wrap">
         <button class="new-chat-btn" id="new-chat-panel-btn" title="New Chat">+</button>
@@ -903,7 +1290,7 @@ ${state === "chat" ? `
           <button class="mode-btn active" id="mode-agent">Agent</button>
           <button class="mode-btn" id="mode-chat">Chat</button>
         </div>
-        <button class="send-btn" id="send-btn" disabled title="Send (Enter)">
+        <button class="send-btn" id="send-btn" disabled title="Send (${useCtrlEnter ? "Ctrl+Enter" : "Enter"})">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
         </button>
       </div>
@@ -913,6 +1300,7 @@ ${state === "chat" ? `
 
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
+const USE_CTRL_ENTER = ${useCtrlEnter ? "true" : "false"};
 window.onerror = (msg, src, line, col, err) => {
   const text = (err ? err.toString() : String(msg)) + ' (' + line + ':' + col + ')';
   try { vscode.postMessage({ type: '_jsError', text }); } catch {}
@@ -1082,6 +1470,48 @@ if (modeChat)  modeChat.addEventListener('click',  () => { agentMode = false; mo
 const newChatPanelBtn = document.getElementById('new-chat-panel-btn');
 if (newChatPanelBtn) newChatPanelBtn.addEventListener('click', () => vscode.postMessage({ type: 'newSession' }));
 
+/* ── Context pills ──────────────────────────────── */
+let fileCtxPill = null;
+let selCtxPill = null;
+let fileCtxDismissed = false;
+let selCtxDismissed = false;
+const contextPillsEl = document.getElementById('context-pills');
+
+function makePill(icon, label, onDismiss) {
+  const div = document.createElement('div');
+  div.className = 'context-pill';
+  const iconSpan = document.createElement('span');
+  iconSpan.className = 'context-pill-icon';
+  iconSpan.textContent = icon;
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'context-pill-name';
+  nameSpan.textContent = label;
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'context-pill-close';
+  closeBtn.title = 'Remove from context';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', onDismiss);
+  div.appendChild(iconSpan);
+  div.appendChild(nameSpan);
+  div.appendChild(closeBtn);
+  return div;
+}
+
+function renderContextPills() {
+  if (!contextPillsEl) return;
+  contextPillsEl.innerHTML = '';
+  if (fileCtxPill && !fileCtxDismissed) {
+    const name = fileCtxPill.name || (fileCtxPill.path || '').split('/').pop() || fileCtxPill.path;
+    contextPillsEl.appendChild(makePill('📄', name, () => { fileCtxDismissed = true; renderContextPills(); }));
+  }
+  if (selCtxPill && !selCtxDismissed) {
+    const lineRange = selCtxPill.startLine === selCtxPill.endLine
+      ? 'line ' + selCtxPill.startLine
+      : 'lines ' + selCtxPill.startLine + '–' + selCtxPill.endLine;
+    contextPillsEl.appendChild(makePill('≡', lineRange, () => { selCtxDismissed = true; renderContextPills(); }));
+  }
+}
+
 /* ── Chat ───────────────────────────────────────── */
 const STATUS_MSGS = [
   "Reticulating splines...",
@@ -1165,7 +1595,13 @@ if (msgInput) {
     if (sendBtn) sendBtn.disabled = !msgInput.value.trim() || busy;
   });
   msgInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); trySend(); }
+    if (USE_CTRL_ENTER) {
+      // Ctrl+Enter or Cmd+Enter sends; plain Enter and Shift+Enter add newline
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); trySend(); }
+    } else {
+      // Default: plain Enter sends, Shift+Enter adds newline
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); trySend(); }
+    }
   });
 }
 if (sendBtn) sendBtn.addEventListener('click', trySend);
@@ -1177,7 +1613,17 @@ function trySend() {
   msgInput.value = '';
   autoResize();
   if (sendBtn) sendBtn.disabled = true;
-  vscode.postMessage({ type: 'send', text, opts: { agentMode, allowBash: useBash, allowWebSearch: useWeb } });
+  vscode.postMessage({ type: 'send', text, opts: {
+    agentMode,
+    allowBash: useBash,
+    allowWebSearch: useWeb,
+    includeFile: !fileCtxDismissed && !!fileCtxPill,
+    includeSelection: !selCtxDismissed && !!selCtxPill,
+  }});
+  // Selection is one-shot — clear after send
+  selCtxPill = null;
+  selCtxDismissed = false;
+  renderContextPills();
 }
 
 function autoResize() {
@@ -1390,6 +1836,199 @@ function setBusy(val) {
   if (sendBtn) sendBtn.disabled = val || !msgInput?.value.trim();
 }
 
+/* ── Context token indicator ────────────────────── */
+const contextIndicator = document.getElementById('context-indicator');
+const contextTokenEst  = document.getElementById('context-token-est');
+let totalCharCount = 0;
+
+function updateContextIndicator(addChars) {
+  totalCharCount += (addChars || 0);
+  const est = Math.round(totalCharCount / 4);
+  const display = est >= 1000 ? (est / 1000).toFixed(1) + 'k' : est;
+  if (contextTokenEst) contextTokenEst.textContent = '~' + display + ' tokens used';
+  if (totalCharCount > 0) contextIndicator?.classList.add('visible');
+}
+
+/* ── @-mention file picker ──────────────────────── */
+const atPicker = document.getElementById('at-picker');
+let atPickerOpen = false;
+let atQuery = '';
+let atStartPos = -1;
+let atFiles = [];
+
+function openAtPicker(query, startPos) {
+  atQuery = query;
+  atStartPos = startPos;
+  atPickerOpen = true;
+  atPicker?.classList.add('open');
+  vscode.postMessage({ type: 'requestFiles', query });
+}
+function closeAtPicker() {
+  atPickerOpen = false;
+  atPicker?.classList.remove('open');
+  atQuery = '';
+  atStartPos = -1;
+  atFiles = [];
+}
+function renderAtPicker(files) {
+  if (!atPicker) return;
+  atFiles = files;
+  if (!files.length) { closeAtPicker(); return; }
+  atPicker.innerHTML = files.slice(0, 10).map((f, i) =>
+    \`<div class="at-picker-item" data-i="\${i}" data-rel="\${esc(f.relativePath)}">
+      <span>\${esc(f.name)}</span>
+      <span class="at-picker-rel">\${esc(f.relativePath)}</span>
+    </div>\`
+  ).join('');
+  atPicker.querySelectorAll('.at-picker-item').forEach(el => {
+    el.addEventListener('click', () => selectAtFile(el.dataset.rel));
+  });
+}
+function selectAtFile(rel) {
+  if (!msgInput || atStartPos < 0) { closeAtPicker(); return; }
+  const before = msgInput.value.slice(0, atStartPos);
+  const after  = msgInput.value.slice(atStartPos + 1 + atQuery.length);
+  msgInput.value = before + '@' + rel + after;
+  const pos = (before + '@' + rel).length;
+  msgInput.setSelectionRange(pos, pos);
+  autoResize();
+  if (sendBtn) sendBtn.disabled = !msgInput.value.trim() || busy;
+  closeAtPicker();
+  msgInput.focus();
+}
+
+/* ── Slash command menu ─────────────────────────── */
+const slashMenu = document.getElementById('slash-menu');
+const SLASH_COMMANDS = [
+  { cmd: '/new',     desc: 'Start a new session' },
+  { cmd: '/compact', desc: 'Summarize conversation to free context' },
+  { cmd: '/verbose', desc: 'Toggle verbose mode (thinking blocks + tool args)' },
+  { cmd: '/clear',   desc: 'Clear the chat display (session kept on server)' },
+  { cmd: '/help',    desc: 'Show available slash commands' },
+];
+let slashMenuOpen = false;
+let slashQuery = '';
+
+function openSlashMenu(query) {
+  slashQuery = query;
+  slashMenuOpen = true;
+  slashMenu?.classList.add('open');
+  renderSlashMenu(query);
+}
+function closeSlashMenu() {
+  slashMenuOpen = false;
+  slashMenu?.classList.remove('open');
+  slashQuery = '';
+}
+function renderSlashMenu(query) {
+  if (!slashMenu) return;
+  const q = query.toLowerCase();
+  const filtered = SLASH_COMMANDS.filter(c => !q || c.cmd.includes(q));
+  if (!filtered.length) { closeSlashMenu(); return; }
+  slashMenu.innerHTML = filtered.map((c, i) =>
+    \`<div class="slash-menu-item" data-cmd="\${esc(c.cmd)}" data-i="\${i}">
+      <span class="slash-cmd">\${esc(c.cmd)}</span>
+      <span class="slash-desc">\${esc(c.desc)}</span>
+    </div>\`
+  ).join('');
+  slashMenu.querySelectorAll('.slash-menu-item').forEach(el => {
+    el.addEventListener('click', () => executeSlashCmd(el.dataset.cmd));
+  });
+}
+function executeSlashCmd(cmd) {
+  if (msgInput) { msgInput.value = ''; autoResize(); }
+  closeSlashMenu();
+  switch (cmd) {
+    case '/new':     vscode.postMessage({ type: 'newSession' }); break;
+    case '/verbose': verboseMode = !verboseMode; applyVerbose(); break;
+    case '/clear':
+      clearStatus();
+      if (messagesEl) messagesEl.innerHTML = '';
+      currentAssistantEl = currentBodyEl = currentToolWrap = currentStatusEl = null;
+      currentThinkingEl = null; thinkingText = ''; currentRound = 0;
+      toolCallCount = 0; thinkingBlockCount = 0; updateReasoningCount();
+      totalCharCount = 0; updateContextIndicator(0);
+      break;
+    case '/help': {
+      const helpText = SLASH_COMMANDS.map(c => c.cmd + ' — ' + c.desc).join('\\n');
+      const div = document.createElement('div');
+      div.className = 'msg assistant';
+      div.innerHTML = \`<div class="msg-role">Odysseus</div><div class="msg-body">\${esc(helpText)}</div>\`;
+      messagesEl?.appendChild(div);
+      scrollBottom();
+      break;
+    }
+    case '/compact':
+      vscode.postMessage({ type: 'send', text: 'Please summarize our conversation so far in 2-3 sentences to compact context.', opts: { agentMode: false } });
+      break;
+  }
+  msgInput?.focus();
+}
+
+/* Override msgInput keydown to handle @-picker and slash-menu navigation */
+function handleAtSlashKeydown(e) {
+  if (atPickerOpen) {
+    const items = [...(atPicker?.querySelectorAll('.at-picker-item') || [])];
+    if (e.key === 'Escape') { e.preventDefault(); closeAtPicker(); return; }
+    if (e.key === 'Enter' && items.length) { e.preventDefault(); const active = atPicker?.querySelector('.at-picker-item.kb-active') || items[0]; selectAtFile(active.dataset.rel); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const cur = items.findIndex(el => el.classList.contains('kb-active'));
+      items.forEach(el => el.classList.remove('kb-active'));
+      const next = e.key === 'ArrowDown' ? (cur < items.length - 1 ? cur + 1 : 0) : (cur > 0 ? cur - 1 : items.length - 1);
+      items[next]?.classList.add('kb-active');
+      items[next]?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+  }
+  if (slashMenuOpen) {
+    const items = [...(slashMenu?.querySelectorAll('.slash-menu-item') || [])];
+    if (e.key === 'Escape') { e.preventDefault(); closeSlashMenu(); return; }
+    if (e.key === 'Enter' && items.length) { e.preventDefault(); const active = slashMenu?.querySelector('.slash-menu-item.kb-active') || items[0]; executeSlashCmd(active.dataset.cmd); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const cur = items.findIndex(el => el.classList.contains('kb-active'));
+      items.forEach(el => el.classList.remove('kb-active'));
+      const next = e.key === 'ArrowDown' ? (cur < items.length - 1 ? cur + 1 : 0) : (cur > 0 ? cur - 1 : items.length - 1);
+      items[next]?.classList.add('kb-active');
+      return;
+    }
+  }
+}
+
+if (msgInput) {
+  msgInput.addEventListener('keydown', handleAtSlashKeydown);
+  msgInput.addEventListener('input', () => {
+    const val = msgInput.value;
+    const pos = msgInput.selectionStart ?? val.length;
+    // Slash menu: detect / at start (or after whitespace)
+    const beforeCursor = val.slice(0, pos);
+    const slashMatch = beforeCursor.match(/(^|\\s)\\/([\\w]*)$/);
+    if (slashMatch) {
+      const q = slashMatch[2];
+      if (slashMenuOpen) { slashQuery = q; renderSlashMenu(q); }
+      else { openSlashMenu(q); }
+    } else if (slashMenuOpen) {
+      closeSlashMenu();
+    }
+    // @-mention picker: detect @ at word boundary
+    const atMatch = beforeCursor.match(/(^|\\s)@([\\w./\\-]*)$/);
+    if (atMatch) {
+      const q = atMatch[2];
+      const startPos = pos - 1 - q.length; // position of '@'
+      if (atPickerOpen) { atQuery = q; atStartPos = startPos; vscode.postMessage({ type: 'requestFiles', query: q }); }
+      else { openAtPicker(q, startPos); }
+    } else if (atPickerOpen) {
+      closeAtPicker();
+    }
+  });
+}
+
+document.addEventListener('click', e => {
+  if (atPickerOpen && !atPicker?.contains(e.target)) closeAtPicker();
+  if (slashMenuOpen && !slashMenu?.contains(e.target)) closeSlashMenu();
+});
+
 /* ── Messages from extension ────────────────────── */
 window.addEventListener('message', e => {
   const msg = e.data;
@@ -1403,7 +2042,11 @@ window.addEventListener('message', e => {
       break;
     case 'userMessage':    setBusy(true); addUserMsg(msg.text); break;
     case 'assistantStart': startAssistant(); break;
-    case 'assistantDone':  finishAssistant(); setBusy(false); break;
+    case 'assistantDone':
+      finishAssistant(); setBusy(false);
+      // Update context estimate from rendered text
+      updateContextIndicator(messagesEl ? messagesEl.textContent?.length ?? 0 : 0);
+      break;
     case 'streamEvent': {
       const ev = msg.event;
       if (ev.type === 'thinking') {
@@ -1423,6 +2066,15 @@ window.addEventListener('message', e => {
       }
       break;
     }
+    case 'contextUpdate': {
+      const prevPath = fileCtxPill?.path;
+      fileCtxPill = msg.file;
+      selCtxPill = msg.selection;
+      if (msg.file?.path !== prevPath) fileCtxDismissed = false;
+      if (msg.selection) selCtxDismissed = false;
+      renderContextPills();
+      break;
+    }
     case 'modelsLoaded':
       allModels = msg.models || [];
       currentModel = msg.currentModel || (allModels[0]?.model ?? '');
@@ -1433,14 +2085,83 @@ window.addEventListener('message', e => {
       if (pickerLabel) pickerLabel.textContent = msg.model;
       if (pickerOpen) renderModelList(modelSearch?.value || '');
       break;
-    case 'prefillSelection':
+    case 'prefillSelection': {
       if (msgInput) {
-        msgInput.value = \`Explain this \${msg.language} code:\\n\`;
+        const basename = (msg.filePath || '').split('/').pop() || (msg.filePath || '').split('\\\\').pop() || 'file';
+        const lineRef = msg.startLine === msg.endLine
+          ? \`\${msg.startLine}\`
+          : \`\${msg.startLine}-\${msg.endLine}\`;
+        const ref = \`@\${basename}:\${lineRef}\`;
+        const existing = msgInput.value;
+        msgInput.value = existing ? existing + '\\n' + ref : ref;
         msgInput.focus();
+        msgInput.setSelectionRange(msgInput.value.length, msgInput.value.length);
         autoResize();
-        if (sendBtn) sendBtn.disabled = false;
+        if (sendBtn) sendBtn.disabled = !msgInput.value.trim() || busy;
       }
       break;
+    }
+    case 'filesResult':
+      if (atPickerOpen) renderAtPicker(msg.files || []);
+      break;
+    case 'insertAtMention':
+      if (msgInput && msg.ref) {
+        const existing = msgInput.value;
+        msgInput.value = existing ? existing + ' ' + msg.ref : String(msg.ref);
+        msgInput.focus();
+        msgInput.setSelectionRange(msgInput.value.length, msgInput.value.length);
+        autoResize();
+        if (sendBtn) sendBtn.disabled = !msgInput.value.trim() || busy;
+      }
+      break;
+    case 'prefillPrompt':
+      if (msgInput && msg.text) {
+        msgInput.value = String(msg.text);
+        msgInput.focus();
+        msgInput.setSelectionRange(msgInput.value.length, msgInput.value.length);
+        autoResize();
+        if (sendBtn) sendBtn.disabled = !msgInput.value.trim() || busy;
+      }
+      break;
+    case 'editProposed': {
+      if (!currentAssistantEl) break;
+      const name = String(msg.path || '').split('/').pop() || String(msg.path || '');
+      const bar = document.createElement('div');
+      bar.className = 'edit-proposal';
+      bar.dataset.path = String(msg.path || '');
+      bar.innerHTML = \`<span>📄</span><span class="edit-proposal-name">\${esc(name)} was modified</span>
+        <button class="edit-proposal-btn" data-action="diff" data-path="\${esc(String(msg.path||''))}">View diff</button>
+        <button class="edit-proposal-btn" data-action="revert" data-path="\${esc(String(msg.path||''))}">Revert</button>\`;
+      bar.querySelectorAll('.edit-proposal-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          vscode.postMessage({ type: btn.dataset.action === 'revert' ? 'revertEdit' : 'viewDiff', path: btn.dataset.path });
+        });
+      });
+      currentAssistantEl.appendChild(bar);
+      scrollBottom();
+      break;
+    }
+    case 'sessionSwitched': {
+      const div = document.createElement('div');
+      div.style.cssText = 'text-align:center;font-size:11px;opacity:0.4;padding:8px 0;';
+      div.textContent = '— switched to: ' + String(msg.sessionName || 'session') + ' —';
+      messagesEl?.appendChild(div);
+      scrollBottom();
+      break;
+    }
+    case 'loadHistory': {
+      clearStatus();
+      if (messagesEl) messagesEl.innerHTML = '';
+      const msgs = msg.messages || [];
+      for (const m of msgs) {
+        const div = document.createElement('div');
+        div.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        div.innerHTML = \`<div class="msg-role">\${m.role === 'user' ? 'You' : 'Odysseus'}</div><div class="msg-body">\${esc(m.content || '')}</div>\`;
+        messagesEl.appendChild(div);
+      }
+      scrollBottom();
+      break;
+    }
     case 'authError':
       if (authError) { authError.textContent = msg.message; authError.style.display = ''; }
       if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
@@ -1466,6 +2187,8 @@ interface SendOpts {
   agentMode?: boolean;
   allowBash?: boolean;
   allowWebSearch?: boolean;
+  includeFile?: boolean;
+  includeSelection?: boolean;
 }
 
 /** Parse file path from write_file or bash tool output. Returns null if not found. */
