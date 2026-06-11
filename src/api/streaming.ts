@@ -101,7 +101,11 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
           return;
         }
 
+        console.log(`[Odysseus] stream connected: HTTP ${res.statusCode}`);
         let buffer = "";
+        let eventCount = 0;
+        let deltaCount = 0;
+        let unknownRaws: string[] = [];
 
         res.on("data", (chunk: Buffer) => {
           buffer += chunk.toString();
@@ -123,8 +127,15 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
             try {
               const parsed = JSON.parse(raw);
               const event = parseEvent(parsed);
+              eventCount++;
               if (event) {
+                if (event.type === "delta") { deltaCount++; }
                 onEvent(event);
+              } else {
+                // Unrecognized event — log the raw shape for debugging
+                if (unknownRaws.length < 3) {
+                  unknownRaws.push(raw.slice(0, 200));
+                }
               }
             } catch {
               // malformed chunk — skip
@@ -132,7 +143,25 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
           }
         });
 
-        res.on("end", () => resolve());
+        res.on("end", () => {
+          // Flush any remaining buffered data that lacked a trailing \n\n
+          if (buffer.trim()) {
+            const dataLine = buffer.split("\n").find((l) => l.startsWith("data: "));
+            if (dataLine) {
+              const raw = dataLine.slice(6).trim();
+              if (raw && raw !== "[DONE]") {
+                try {
+                  const parsed = JSON.parse(raw);
+                  const event = parseEvent(parsed);
+                  if (event) { onEvent(event); }
+                } catch { /* malformed — skip */ }
+              }
+            }
+          }
+          console.log(`[Odysseus] stream ended: ${eventCount} events, ${deltaCount} deltas` +
+            (unknownRaws.length ? `, ${unknownRaws.length} unrecognized: ${unknownRaws.join(" | ")}` : ""));
+          resolve();
+        });
         res.on("error", reject);
       }
     );

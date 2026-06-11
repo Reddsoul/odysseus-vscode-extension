@@ -1040,10 +1040,11 @@ body.verbose .chat-header { display: flex; }
   text-transform: uppercase;
   letter-spacing: 0.08em;
   margin: 8px 0 4px;
-  display: flex;
+  display: none;
   align-items: center;
   gap: 6px;
 }
+body.verbose .round-header { display: flex; }
 .round-header::after {
   content: '';
   flex: 1;
@@ -1051,7 +1052,15 @@ body.verbose .chat-header { display: flex; }
   background: currentColor;
   opacity: 0.2;
 }
-.step-badge { font-size: 10px; opacity: 0.4; font-style: italic; }
+.step-badge { font-size: 10px; opacity: 0.4; font-style: italic; display: none; }
+body.verbose .step-badge { display: block; }
+
+/* Final answer: clearly the response, distinct from interim round narration */
+.msg.assistant .msg-body.final-answer {
+  border-left: 2px solid rgba(126,197,126,0.5);
+  padding-left: 10px;
+  margin-left: -12px;
+}
 .cursor::after { content: "▌"; animation: blink 1s step-end infinite; opacity: 0.7; }
 @keyframes blink { 50% { opacity: 0; } }
 
@@ -2000,10 +2009,14 @@ const TOOL_META = {
 let currentRound = 0;
 let currentThinkingEl = null;
 let thinkingText = '';
-let streamBuffer = '';
+let segmentBuffer = '';          // text of the in-progress response segment
+let responseHadActivity = false; // true if current response had any tool calls or thinking
+let renderedAnyText = false;     // any real answer text rendered this turn
+let lastFinalBodyEl = null;      // most recent rendered text segment (the final answer)
 
 function startThinking() {
   if (!currentAssistantEl) return;
+  responseHadActivity = true;
   thinkingText = '';
   currentThinkingEl = document.createElement('div');
   currentThinkingEl.className = 'thinking-section';
@@ -2066,7 +2079,10 @@ function startAssistant() {
   currentRound = 0;
   currentThinkingEl = null;
   thinkingText = '';
-  streamBuffer = '';
+  segmentBuffer = '';
+  responseHadActivity = false;
+  renderedAnyText = false;
+  lastFinalBodyEl = null;
   currentAssistantEl = document.createElement('div');
   currentAssistantEl.className = 'msg assistant';
   currentAssistantEl.innerHTML = '<div class="msg-role">Odysseus</div>';
@@ -2092,16 +2108,64 @@ function clearStatus() {
   currentStatusEl = null;
 }
 
+// Start a fresh response text segment at the end of the turn (before the status row).
+function createBodySegment() {
+  const b = document.createElement('div');
+  b.className = 'msg-body cursor';
+  if (currentStatusEl && currentStatusEl.parentElement === currentAssistantEl) {
+    currentAssistantEl.insertBefore(b, currentStatusEl);
+  } else if (currentAssistantEl) {
+    currentAssistantEl.appendChild(b);
+  }
+  currentBodyEl = b;
+  segmentBuffer = '';
+}
+
 function appendDelta(text) {
-  if (!currentBodyEl) return;
-  streamBuffer += text;
-  currentBodyEl.textContent = streamBuffer;
+  if (!currentAssistantEl) return;
+  if (!currentBodyEl) createBodySegment();
+  segmentBuffer += text;
+  currentBodyEl.textContent = cleanForLive(segmentBuffer);
   scrollBottom();
+}
+
+// Seal the active segment: pull <think> reasoning into dropdowns, markdown-render
+// the answer text, drop the segment if it held no real text. Called at every tool/
+// round boundary so text and tool chips interleave chronologically (like the webapp).
+function finalizeSegment() {
+  if (!currentBodyEl) return;
+  const { blocks, rest } = extractThinkBlocks(cleanBody(segmentBuffer));
+  for (const bt of blocks) {
+    const sec = buildThinkingSection(bt);
+    currentAssistantEl.insertBefore(sec, currentBodyEl);
+    thinkingBlockCount++;
+    updateReasoningCount();
+  }
+  if (rest) {
+    try {
+      const html = typeof marked !== 'undefined' ? marked.parse(rest) : '';
+      currentBodyEl.innerHTML = html || '';
+      if (!html) currentBodyEl.textContent = rest;
+    } catch { currentBodyEl.textContent = rest; }
+    addCopyButtons(currentBodyEl);
+    currentBodyEl.classList.remove('cursor');
+    // Mark the previous final answer as interim; only the latest stays highlighted.
+    if (lastFinalBodyEl) lastFinalBodyEl.classList.remove('final-answer');
+    currentBodyEl.classList.add('final-answer');
+    lastFinalBodyEl = currentBodyEl;
+    renderedAnyText = true;
+  } else {
+    currentBodyEl.remove();
+  }
+  currentBodyEl = null;
+  segmentBuffer = '';
 }
 
 function addTool(tool, command, round, toolInput) {
   if (!currentAssistantEl) return;
+  finalizeSegment();
 
+  responseHadActivity = true;
   toolCallCount++;
   updateReasoningCount();
 
@@ -2164,6 +2228,7 @@ function finishTool(output, exitCode) {
 
 function addStep(round) {
   if (!currentAssistantEl) return;
+  finalizeSegment();
   const b = document.createElement('div');
   b.className = 'step-badge';
   b.textContent = \`round \${round}…\`;
@@ -2171,19 +2236,135 @@ function addStep(round) {
   if (currentStatusEl) currentAssistantEl.appendChild(currentStatusEl);
 }
 
+/* Split inline <think>…</think> reasoning out of a response body.
+   Agent mode streams reasoning as inline tags (no thinking:true flag), so we
+   extract them here to match the webapp's processWithThinking behavior. */
+function extractThinkBlocks(text) {
+  const blocks = [];
+  let rest = text;
+  // 1) complete <think>…</think> / <thinking>…</thinking> blocks
+  rest = rest.replace(/<think(?:ing)?(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/think(?:ing)?>/gi, (_m, c) => {
+    const t = (c || '').trim();
+    if (t) blocks.push(t);
+    return '';
+  });
+  // 2) orphan close: leaked thinking before a lone </think> (reasoning models)
+  const oc = rest.match(/^([\\s\\S]*?)<\\/think(?:ing)?>([\\s\\S]*)$/i);
+  if (oc) {
+    const t = (oc[1] || '').trim();
+    if (t) blocks.push(t);
+    rest = oc[2];
+  }
+  // 3) stray/unclosed opener — truncated thinking, drop from the tag onward
+  const so = rest.match(/<think(?:ing)?(?:\\s+[^>]*)?>([\\s\\S]*)$/i);
+  if (so) {
+    const t = (so[1] || '').trim();
+    if (t) blocks.push(t);
+    rest = rest.replace(/<think(?:ing)?(?:\\s+[^>]*)?>[\\s\\S]*$/i, '');
+  }
+  return { blocks, rest: rest.trim() };
+}
+
+/* Live display string — hide raw <think> tags while streaming so the panel
+   stays clean before finishAssistant re-renders into dropdowns. */
+function stripThinkForLive(t) {
+  return extractThinkBlocks(t).rest;
+}
+
+/* Strip inline tool-call markup the model emits into its text (the real tool
+   runs as a separate chip). Mirrors the webapp's stripToolBlocks so bash/XML/
+   DSML/[TOOL_CALL]/exec-fence invocations never leak into the answer body. */
+function stripToolBlocks(text) {
+  let c = String(text || '');
+  c = c.replace(/\\[TOOL_CALL\\][\\s\\S]*?\\[\\/TOOL_CALL\\]/gi, '');
+  c = c.replace(/\\x60{3}(?:web_search|read_file|write_file|create_document|edit_document|update_document)\\s*\\n[\\s\\S]*?\\x60{3}/gi, '');
+  c = c.replace(/<(?:[\\w]+:)?(?:tool_call|function_call)>[\\s\\S]*?<\\/(?:[\\w]+:)?(?:tool_call|function_call)>/gi, '');
+  c = c.replace(/<invoke\\s+name=['"][^'"]*['"]>[\\s\\S]*?<\\/invoke>/gi, '');
+  c = c.replace(/<\\s*[｜|]+\\s*DSML\\s*[｜|]+\\s*tool_calls\\s*>[\\s\\S]*?(?:<\\s*\\/\\s*[｜|]+\\s*DSML\\s*[｜|]+\\s*tool_calls\\s*>|$)/gi, '');
+  c = c.replace(/<\\s*\\/?\\s*[｜|]+\\s*DSML\\s*[｜|]+[^>]*>/gi, '');
+  c = c.replace(/\\n{3,}/g, '\\n\\n');
+  return c.trim();
+}
+
+/* Collapse runaway blank lines outside fenced code (webapp squashOutsideCode). */
+function squashOutsideCode(s) {
+  if (!s) return '';
+  const parts = String(s).split(/\\x60{3}/);
+  for (let i = 0; i < parts.length; i += 2) {
+    parts[i] = parts[i].replace(/\\r\\n/g, '\\n').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n');
+  }
+  return parts.join(String.fromCharCode(96, 96, 96));
+}
+
+/* Full body cleanup before markdown render: drop tool markup, squash blanks. */
+function cleanBody(text) {
+  return squashOutsideCode(stripToolBlocks(text));
+}
+
+/* Live (streaming) cleanup — also drops still-incomplete tool-call openers so
+   half-streamed markup doesn't flash in the panel. */
+function cleanForLive(text) {
+  let c = stripToolBlocks(text);
+  c = c.replace(/<(?:[\\w]+:)?(?:tool_call|function_call)>[\\s\\S]*$/i, '');
+  c = c.replace(/<invoke\\s+name=['"][^'"]*['"]>[\\s\\S]*$/i, '');
+  c = c.replace(/\\[TOOL_CALL\\][\\s\\S]*$/i, '');
+  return stripThinkForLive(c);
+}
+
+/* Build a collapsed thinking dropdown pre-filled with content. Returns the element. */
+function buildThinkingSection(contentText) {
+  const sec = document.createElement('div');
+  sec.className = 'thinking-section';
+  const words = contentText.trim().split(/\\s+/).filter(Boolean).length;
+  sec.innerHTML =
+    \`<div class="thinking-header" role="button" tabindex="0">
+       <div class="thinking-header-left">
+         <span class="thinking-label">💭 thinking (\${words} word\${words === 1 ? '' : 's'})</span>
+         <span class="thinking-preview"></span>
+       </div>
+       <span class="thinking-chevron">
+         <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+       </span>
+     </div>
+     <div class="thinking-content"></div>\`;
+  const content = sec.querySelector('.thinking-content');
+  const preview = sec.querySelector('.thinking-preview');
+  if (content) content.textContent = contentText;
+  if (preview) {
+    const first = contentText.replace(/\\n/g, ' ').slice(0, 60);
+    preview.textContent = first ? '— ' + first : '';
+  }
+  sec.querySelector('.thinking-header').addEventListener('click', () => {
+    sec.querySelector('.thinking-content').classList.toggle('open');
+    sec.querySelector('.thinking-chevron').classList.toggle('open');
+  });
+  setThinkingOpen(sec, verboseMode);
+  return sec;
+}
+
+/* Build a thinking dropdown and insert it before the active response body. */
+function insertThinkingBlock(contentText) {
+  if (!currentAssistantEl || !currentBodyEl) return;
+  const sec = buildThinkingSection(contentText);
+  currentAssistantEl.insertBefore(sec, currentBodyEl);
+  thinkingBlockCount++;
+  updateReasoningCount();
+}
+
 function finishAssistant() {
   if (currentThinkingEl) finishThinking();
-  if (currentBodyEl && streamBuffer) {
-    try {
-      const html = marked.parse(streamBuffer);
-      currentBodyEl.innerHTML = html;
-    } catch { /* fallback: leave as text */ }
-    addCopyButtons(currentBodyEl);
+  finalizeSegment();
+  // Nothing rendered and no tools/thinking ran — show a clear placeholder
+  if (!renderedAnyText && !responseHadActivity && currentAssistantEl) {
+    const b = document.createElement('div');
+    b.className = 'msg-body';
+    b.textContent = '[No response text received — check extension host logs for stream details]';
+    b.style.cssText = 'opacity:0.45;font-style:italic;font-size:11px;';
+    currentAssistantEl.appendChild(b);
   }
-  streamBuffer = '';
-  currentBodyEl?.classList.remove('cursor');
   clearStatus();
-  currentAssistantEl = currentBodyEl = currentToolWrap = null;
+  segmentBuffer = '';
+  currentAssistantEl = currentBodyEl = currentToolWrap = lastFinalBodyEl = null;
 }
 
 function addCopyButtons(container) {
@@ -2480,7 +2661,14 @@ window.addEventListener('message', e => {
       }
       if (ev.type === 'error') {
         clearStatus();
-        if (currentBodyEl) currentBodyEl.textContent += '\\n[Error: ' + ev.message + ']';
+        finalizeSegment();
+        if (currentAssistantEl) {
+          const errEl = document.createElement('div');
+          errEl.className = 'msg-body';
+          errEl.style.cssText = 'color:var(--vscode-errorForeground);font-size:12px;';
+          errEl.textContent = '[Error: ' + ev.message + ']';
+          currentAssistantEl.appendChild(errEl);
+        }
       }
       break;
     }
@@ -2657,8 +2845,14 @@ window.addEventListener('message', e => {
         div.innerHTML = \`<div class="msg-role">\${m.role === 'user' ? 'You' : 'Odysseus'}</div><div class="msg-body"></div>\`;
         const bodyEl = div.querySelector('.msg-body');
         if (m.role === 'assistant' && typeof marked !== 'undefined') {
-          try { bodyEl.innerHTML = marked.parse(displayContent); addCopyButtons(bodyEl); }
-          catch { bodyEl.textContent = displayContent; }
+          // Pull inline <think> reasoning into collapsible dropdowns before the body
+          const { blocks, rest } = extractThinkBlocks(cleanBody(displayContent));
+          for (const bt of blocks) {
+            const sec = buildThinkingSection(bt);
+            div.insertBefore(sec, bodyEl);
+          }
+          try { bodyEl.innerHTML = marked.parse(rest); addCopyButtons(bodyEl); }
+          catch { bodyEl.textContent = rest; }
         } else {
           bodyEl.textContent = displayContent;
         }

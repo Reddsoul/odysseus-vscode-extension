@@ -1,9 +1,23 @@
 {
-  "name": "odysseus-vscode-extension",
-  "displayName": "Odysseus AI Helper",
-  "description": "Ask questions to your local Odysseus AI server (http://localhost:7860)",
-  "version": "0.0.1",
+  "name": "odysseus",
+  "displayName": "Odysseus vscode Extension",
+  "description": "Chat panel for Odysseus — a self-hosted AI assistant with agent tools, streaming, and session management.",
+  "version": "0.0.10",
   "publisher": "JoseAlma",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Reddsoul/odysseus-vscode-extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Reddsoul/odysseus-vscode-extension/issues"
+  },
+  "homepage": "https://github.com/Reddsoul/odysseus-vscode-extension#readme",
+  "galleryBanner": {
+    "color": "#191929",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -128,22 +142,26 @@
         {
           "type": "webview",
           "id": "odysseus.chatView",
-          "name": "Odysseus AI"
+          "name": "Odysseus AI",
+          "icon": "resources/icon.svg"
         },
         {
           "type": "webview",
           "id": "odysseus.memoryView",
-          "name": "Memories"
+          "name": "Memories",
+          "icon": "resources/icon.svg"
         },
         {
           "type": "webview",
           "id": "odysseus.notesView",
-          "name": "Notes"
+          "name": "Notes",
+          "icon": "resources/icon.svg"
         }
       ]
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./"
   },

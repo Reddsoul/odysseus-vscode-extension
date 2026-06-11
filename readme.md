@@ -1,6 +1,6 @@
 # Odysseus AI Helper
 
-VS Code extension for [Odysseus](https://github.com/your-repo/odysseus) — a self-hosted AI assistant. Connects to your local Odysseus server and gives you an agent-capable chat panel directly inside VS Code.
+VS Code extension for a self-hosted Odysseus AI assistant. Connects to your local Odysseus server and gives you an agent-capable chat panel directly inside VS Code.
 
 ## Requirements
 
@@ -25,6 +25,12 @@ VS Code extension for [Odysseus](https://github.com/your-repo/odysseus) — a se
 - Verbose mode — reveals tool input args and reasoning step counts
 - Rotating status messages while waiting (the important ones)
 
+### Memories
+- **Sidebar Memories panel** — create, filter, and delete AI memories that persist across sessions. Memories are injected into every chat to help the agent remember your preferences, project context, and important details.
+
+### Notes
+- **Sidebar Notes panel** — persistent notes and TODO lists with pinning and completion toggles. Notes survive across sessions and workspace reloads.
+
 ### Context Awareness
 - Active file pill — automatically injects the open file into every message
 - Selection pill — injects highlighted code with line numbers
@@ -34,6 +40,10 @@ VS Code extension for [Odysseus](https://github.com/your-repo/odysseus) — a se
 - `odysseus.sendSelection` command — appends a `@file:line` reference to the chat input
 - Workspace file listing (gitignore-aware) sent as context on every message
 
+### Message History
+- **Edit & delete past messages** — hover any message in the conversation history to reveal edit and delete buttons. Edit a message to re-send it to the agent; delete to remove it.
+- Message history replay when switching sessions (falls back to a divider if backend has no history endpoint)
+
 ### Edit Review
 - Pre-send autosave — dirty buffers are saved before the agent runs so it reads fresh disk content
 - Post-write diff viewer — when the agent modifies a file, a VS Code diff opens automatically showing original vs modified
@@ -41,6 +51,7 @@ VS Code extension for [Odysseus](https://github.com/your-repo/odysseus) — a se
 
 ### Session Management
 - Session history sidebar with search, grouped by Today / Yesterday / Last 7 days / Older
+- **Session operations** — hover a session in the sidebar to compact, fork, truncate, star (mark as important), rename, or delete. Compacting summarizes old messages; forking creates an independent copy.
 - Rename and delete sessions (hover a session to reveal actions)
 - Message history replay when switching sessions (falls back to a divider if backend has no history endpoint)
 - Multiple chat panels — `Odysseus: Open New Chat Panel` opens an independent conversation
@@ -56,35 +67,3 @@ VS Code extension for [Odysseus](https://github.com/your-repo/odysseus) — a se
 
 ### Integration
 - URI handler — open a pre-filled chat from any tool:
-  ```
-  open "vscode://JoseAlma.odysseus-vscode-extension/open?prompt=review%20my%20changes"
-  ```
-- `Alt+K` keybinding inserts `@file:line` reference when editor is focused
-- Sidebar retains state when hidden (no flicker/reload on Activity Bar switch)
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `Odysseus: Open Chat` | Open or focus the chat panel |
-| `Odysseus: Open New Chat Panel` | Always open a fresh panel |
-| `Odysseus: New Session` | Start a new session in the active panel |
-| `Odysseus: Send Selection to Chat` | Append `@file:line` reference to chat input |
-| `Odysseus: Insert @-mention for Current File/Selection` | `Alt+K` — insert file reference |
-| `Odysseus: Configure` | Set server URL |
-
-## Settings
-
-| Setting | Default | Description |
-|---|---|---|
-| `odysseus.url` | `http://localhost:7860` | Odysseus server URL |
-| `odysseus.useCtrlEnterToSend` | `false` | Use Ctrl+Enter to send; plain Enter adds newline |
-| `odysseus.agentMode` | `true` | Enable agent mode by default |
-| `odysseus.allowBash` | `true` | Allow bash tool by default |
-| `odysseus.allowWebSearch` | `true` | Allow web search by default |
-
-## Architecture
-
-The extension is a frontend to a remote Odysseus server — it does not make LLM calls directly. The agent runs on the server and communicates via SSE streaming. File edits happen through bash commands executed on the server; the extension detects written paths from tool output and opens diffs after the fact.
-
-This is different from extensions where the AI operates inside VS Code via the edit API. The tradeoff: you get a fully self-hosted stack with your own models, multi-user auth, TOTP 2FA, and any LLM endpoint Odysseus supports — at the cost of post-write rather than pre-write edit approval.
