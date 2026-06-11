@@ -8,3 +8,4 @@ dist/
 TASKS.md
 *.sh
 .smbdelete*
+.gitignore
