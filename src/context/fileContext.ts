@@ -96,9 +96,24 @@ export async function buildApiMessage(
   displayMessage: string,
   workspaceRoot: string | null,
   fileCtx: FileContext | null,
-  freshSession = false
+  freshSession = false,
+  workspaceRules?: string | null,
+  gitContext?: string | null,
+  injectWorkspaceTree = true,
+  ignoreGlob?: string,
+  ignoreBlock?: string
 ): Promise<string> {
   const lines: string[] = [];
+  if (workspaceRules) {
+    lines.push(`<workspace_rules>`);
+    lines.push(workspaceRules.trim());
+    lines.push(`</workspace_rules>`);
+    lines.push(``);
+  }
+  if (ignoreBlock) {
+    lines.push(ignoreBlock);
+    lines.push(``);
+  }
   if (workspaceRoot) {
     lines.push(`<vscode_workspace>`);
     lines.push(`working_directory: ${workspaceRoot}`);
@@ -107,16 +122,39 @@ export async function buildApiMessage(
       lines.push(`language: ${fileCtx.language}`);
     }
     // List workspace files respecting .gitignore via findFiles
-    try {
-      const pattern = new vscode.RelativePattern(workspaceRoot, "**/*");
-      const uris = await vscode.workspace.findFiles(
-        pattern,
-        "{**/node_modules/**,**/out/**,**/dist/**,**/build/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/*.pyo,**/*.map}",
-        60
-      );
-      const relPaths = uris.map(u => vscode.workspace.asRelativePath(u, false)).sort();
-      lines.push(`files: ${relPaths.slice(0, 60).join(", ")}`);
-    } catch { /* ignore */ }
+    if (injectWorkspaceTree) {
+      try {
+        const pattern = new vscode.RelativePattern(workspaceRoot, "**/*");
+        const baseExclude = [
+          "**/node_modules/**",
+          "**/out/**",
+          "**/dist/**",
+          "**/build/**",
+          "**/.git/**",
+          "**/__pycache__/**",
+          "**/*.pyc",
+          "**/*.pyo",
+          "**/*.map",
+          "**/*.lock",
+          "**/.smbdelete*",
+          "**/.DS_Store",
+          "**/._.DS_Store",
+          "**/*.vsix",
+          "**/*.log",
+          "**/*.tmp",
+        ].join(",");
+        const excludePattern = ignoreGlob ? `{${baseExclude},${ignoreGlob}}` : `{${baseExclude}}`;
+        const uris = await vscode.workspace.findFiles(
+          pattern,
+          excludePattern,
+          500
+        );
+        const relPaths = uris.map(u => vscode.workspace.asRelativePath(u, false)).sort();
+        const truncated = relPaths.length > 500;
+        lines.push(`workspace_tree${truncated ? " (truncated at 500)" : ""}:`);
+        lines.push(relPaths.slice(0, 500).join("\n"));
+      } catch { /* ignore */ }
+    }
     // Inject VS Code diagnostics (errors/warnings from Problems panel)
     const diagCtx = getDiagnosticsContext(fileCtx?.filePath ?? undefined);
     if (diagCtx) {
@@ -125,25 +163,48 @@ export async function buildApiMessage(
       lines.push(`</vscode_diagnostics>`);
     }
     lines.push(`</vscode_workspace>`);
+    if (gitContext) {
+      lines.push(`<git_context>`);
+      lines.push(gitContext);
+      lines.push(`</git_context>`);
+    }
     lines.push(`<instructions>`);
     lines.push(`You are an AI coding assistant running inside VS Code, connected to a local Odysseus instance.`);
     lines.push(`The working_directory above is a REAL path on the local filesystem of this machine.`);
-    lines.push(`IMPORTANT — when the user asks you to create, edit, or modify a file:`);
-    lines.push(`  1. If the file already exists and you are ADDING or EDITING content (not replacing everything):`);
-    lines.push(`     - First read it with read_file to get the current contents.`);
-    lines.push(`     - Then write the FULL updated file back using bash (existing content + changes).`);
+    lines.push(``);
+    lines.push(`## Reading files`);
+    lines.push(`ALWAYS check a file's size before reading it:`);
+    lines.push(`  1. Run: wc -l /full/path/to/file`);
+    lines.push(`  2. If the file is under 150 lines: cat it in full.`);
+    lines.push(`  3. If the file is 150–500 lines: read it in two halves using sed:`);
+    lines.push(`       sed -n '1,200p' /path/to/file`);
+    lines.push(`       sed -n '201,400p' /path/to/file`);
+    lines.push(`  4. If the file is over 500 lines: read only the sections you need.`);
+    lines.push(`     Use grep to find relevant function/class names first, then read those line ranges.`);
+    lines.push(`     Example: grep -n "functionName" /path/to/file  → then sed -n 'X,Yp'`);
+    lines.push(`NEVER cat a file over 150 lines in one shot — it wastes the entire context window.`);
+    lines.push(`When you need to read multiple large files, read one section, act on it, then continue.`);
+    lines.push(``);
+    lines.push(`## Writing files`);
+    lines.push(`When the user asks you to create, edit, or modify a file:`);
+    lines.push(`  1. If the file already exists and you are ADDING or EDITING (not replacing everything):`);
+    lines.push(`     - First check its line count with wc -l.`);
+    lines.push(`     - Read it in sections if large (see above).`);
+    lines.push(`     - Write the FULL updated file back using bash heredoc.`);
     lines.push(`     - NEVER use >> to append — always write the complete file so nothing is lost.`);
-    lines.push(`  2. Use the bash tool to write files. Example:`);
-    lines.push(`       bash: cat > /full/path/to/file.md << 'HEREDOC'`);
+    lines.push(`  2. Use bash to write files:`);
+    lines.push(`       cat > /full/path/to/file.md << 'HEREDOC'`);
     lines.push(`       <complete file contents>`);
     lines.push(`       HEREDOC`);
-    lines.push(`  3. Never output file contents as plain chat text when asked to edit — write to disk with bash.`);
+    lines.push(`  3. Never output file contents as plain chat text when asked to edit — write to disk.`);
     lines.push(`  4. After writing, confirm what changed in one sentence.`);
+    lines.push(``);
     lines.push(`CRITICAL — do NOT use update_document, create_document, or edit_document for real filesystem files.`);
     lines.push(`Those tools only modify internal Odysseus notes, NOT actual files on disk.`);
-    lines.push(`For any real file (README.md, .ts, .py, etc.), you MUST use bash to write it.`);
+    lines.push(`For any real file (.md, .ts, .py, etc.) you MUST use bash.`);
     if (diagCtx) {
-      lines.push(`The vscode_diagnostics above are the current errors and warnings from the VS Code Problems panel for this file.`);
+      lines.push(``);
+      lines.push(`The vscode_diagnostics above are the current errors/warnings from the VS Code Problems panel.`);
     }
     lines.push(`</instructions>`);
     lines.push("");

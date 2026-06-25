@@ -30,11 +30,12 @@ export interface StreamChatOptions {
   incognito?: boolean;
   presetId?: string;
   attachments?: string[];
+  workspace?: string;
   onEvent: EventCallback;
 }
 
 export async function streamChat(opts: StreamChatOptions): Promise<void> {
-  const { baseUrl, token, sessionId, message, activeDocId, agentMode, allowBash, allowWebSearch, tzOffset, allowRag, incognito, presetId, attachments, onEvent } = opts;
+  const { baseUrl, token, sessionId, message, activeDocId, agentMode, allowBash, allowWebSearch, tzOffset, allowRag, incognito, presetId, attachments, workspace, onEvent } = opts;
 
   const boundary = `----OdysseusBoundary${Date.now()}`;
   const parts: string[] = [];
@@ -54,6 +55,7 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
   if (incognito)      { addField("incognito", "true"); }
   if (presetId)       { addField("preset_id", presetId); }
   if (attachments && attachments.length > 0) { addField("attachments", JSON.stringify(attachments)); }
+  if (workspace) { addField("workspace", workspace); }
   if (activeDocId) {
     addField("active_doc_id", activeDocId);
   }

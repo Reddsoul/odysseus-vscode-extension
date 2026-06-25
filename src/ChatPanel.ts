@@ -11,6 +11,10 @@ import {
   buildDisplayMessage,
   buildApiMessage,
 } from "./context/fileContext";
+import { getWorkspaceRulesContent } from "./workspaceRules";
+import { getGitContext } from "./gitIntegration";
+import { saveCheckpoints } from "./checkpointManager";
+import { getIgnorePatterns, patternsToGlob, buildIgnoreBlock } from "./odysseusIgnore";
 
 let _markedSrc = "";
 function getMarkedSrc(context: vscode.ExtensionContext): string {
@@ -32,6 +36,20 @@ export class ChatPanel {
   private static updateStatus(text: string): void {
     if (ChatPanel.statusBar) { ChatPanel.statusBar.text = text; }
   }
+  public static updateStatusForRun(active: boolean, step?: number): void {
+    if (!ChatPanel.statusBar) { return; }
+    if (active) {
+      ChatPanel.statusBar.text = `$(sync~spin) Odysseus: running${step != null ? ` (step ${step})` : ""}`;
+      ChatPanel.statusBar.command = "odysseus.cancelRun";
+      ChatPanel.statusBar.tooltip = "Click to cancel";
+      ChatPanel.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    } else {
+      ChatPanel.statusBar.text = "$(comment) Odysseus";
+      ChatPanel.statusBar.command = "odysseus.openChat";
+      ChatPanel.statusBar.tooltip = "Open Odysseus chat";
+      ChatPanel.statusBar.backgroundColor = undefined;
+    }
+  }
 
   private readonly panel: vscode.WebviewPanel;
   private client?: OdysseusClient;
@@ -48,6 +66,11 @@ export class ChatPanel {
   private sessionAutoNamed = false;
   private preEditSnapshots = new Map<string, string>();
   private pendingAttachments: string[] = [];
+  private planMode = false;
+  private autoApproveSession = false;
+  private currentRunId = 0;
+  private isStreaming = false;
+  private pendingModelSwap?: { model: string; endpointUrl: string };
 
   /** Called when the chat panel is disposed, so the sidebar can refresh its list. */
   public static onDidClose?: () => void;
@@ -60,6 +83,13 @@ export class ChatPanel {
           existing.panel.reveal(vscode.ViewColumn.Beside, true);
           return existing;
         }
+      }
+      // A panel is open on a different session — switch it in place (which loads
+      // history) rather than stacking a second panel that the user must hunt for.
+      const reuse = ChatPanel._lastFocused ?? ChatPanel.instances.values().next().value;
+      if (reuse) {
+        void reuse.loadSession(sessionId);
+        return reuse;
       }
     }
     // If no sessionId and there's already a focused panel, just reveal it
@@ -175,6 +205,7 @@ export class ChatPanel {
     const token = await this.context.secrets.get("odysseus.token");
     this.client = new OdysseusClient(url, token);
     this.docSync = new DocSync(this.client);
+    this.planMode = this.context.workspaceState.get<boolean>("odysseus.planMode", false);
 
     try {
       const status = await this.client.getAuthStatus();
@@ -198,7 +229,7 @@ export class ChatPanel {
     if (this.sessionId) {
       const streamStatus = await this.client.getStreamStatus(this.sessionId);
       if (streamStatus?.status === "streaming" && streamStatus.detached) {
-        this.panel.webview.html = this.buildHtml("chat", this.currentModel);
+        this.panel.webview.html = this.buildHtml("chat", this.currentModel, this.planMode);
         setTimeout(() => this.sendModelsToWebview(), 300);
         setTimeout(() => this.sendContextUpdate(), 600);
         setTimeout(() => this.postMessage({ type: "resumePrompt" }), 800);
@@ -207,11 +238,24 @@ export class ChatPanel {
     }
 
     ChatPanel.updateStatus("$(comment) Odysseus: connected");
-    this.panel.webview.html = this.buildHtml("chat", this.currentModel);
+    this.panel.webview.html = this.buildHtml("chat", this.currentModel, this.planMode);
     // Also send immediately after a short delay — postMessage may drop if webview isn't ready yet
     setTimeout(() => this.sendModelsToWebview(), 300);
     setTimeout(() => this.sendModelsToWebview(), 1000);
     setTimeout(() => this.sendContextUpdate(), 600);
+    // Restore prior conversation. ensureSession() bound this.sessionId to either
+    // the session requested from the history sidebar or a saved one — but binding
+    // alone never renders messages, so a freshly-built panel looks like a new chat.
+    if (!this.freshSession) { setTimeout(() => this.postHistory(), 400); }
+  }
+
+  /** Fetch and render the bound session's message history into the webview. */
+  private async postHistory(): Promise<void> {
+    if (!this.client || !this.sessionId) { return; }
+    try {
+      const messages = await this.client.getSessionMessages(this.sessionId);
+      if (messages.length > 0) { this.postMessage({ type: "loadHistory", messages }); }
+    } catch { /* leave panel empty on failure */ }
   }
 
   /** Switch the panel to an existing session (from the history sidebar). */
@@ -316,6 +360,97 @@ export class ChatPanel {
     const results = await this.client.searchMessages(query);
     this.panel.reveal(vscode.ViewColumn.Beside, true);
     this.postMessage({ type: "searchResults", query, results });
+  }
+
+  public async cancelRun(): Promise<void> {
+    if (!this.client || !this.sessionId) { return; }
+    await this.client.stopChat(this.sessionId);
+  }
+
+  public async showSessionDiff(): Promise<void> {
+    if (this.preEditSnapshots.size === 0) {
+      vscode.window.showInformationMessage("Odysseus: no file changes recorded for this session.");
+      return;
+    }
+    const items = [...this.preEditSnapshots.keys()].map(p => ({
+      label: path.basename(p),
+      description: vscode.workspace.asRelativePath(p, false),
+      filePath: p,
+    }));
+    const pick = items.length === 1 ? items[0]
+      : await vscode.window.showQuickPick(items, { title: "Session file changes — select to diff", placeHolder: "Choose a file" });
+    if (!pick) { return; }
+    await this.handleViewDiff(pick.filePath);
+  }
+
+  public async searchCodebase(pattern: string): Promise<void> {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      vscode.window.showWarningMessage("Odysseus: no workspace folder open.");
+      return;
+    }
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern, "i");
+    } catch {
+      regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    }
+    const uris = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(workspaceRoot, "**/*"),
+      "{**/node_modules/**,**/out/**,**/dist/**,**/build/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/*.pyo,**/*.map}",
+      200
+    );
+    const results: string[] = [];
+    for (const uri of uris) {
+      if (results.length >= 20) { break; }
+      try {
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const lines = Buffer.from(bytes).toString("utf-8").split("\n");
+        const rel = vscode.workspace.asRelativePath(uri, false);
+        for (let i = 0; i < lines.length; i++) {
+          if (regex.test(lines[i])) {
+            results.push(`${rel}:${i + 1}: ${lines[i].trim()}`);
+            if (results.length >= 20) { break; }
+          }
+        }
+      } catch { /* skip unreadable */ }
+    }
+    if (results.length === 0) {
+      vscode.window.showInformationMessage(`Odysseus: no matches for "${pattern}"`);
+      return;
+    }
+    const block = `Search results for \`${pattern}\`:\n\`\`\`\n${results.join("\n")}\n\`\`\`\n\n`;
+    this.panel.reveal(vscode.ViewColumn.Beside, true);
+    this.postMessage({ type: "prefillPrompt", text: block });
+  }
+
+  private async checkDiagnosticsAfterRun(paths: string[]): Promise<void> {
+    await new Promise(r => setTimeout(r, 2000));
+    if (this.disposed) { return; }
+    const diagLines: string[] = [];
+    for (const p of paths) {
+      const uri = vscode.Uri.file(p);
+      const diags = vscode.languages.getDiagnostics(uri);
+      const rel = vscode.workspace.asRelativePath(uri, false);
+      for (const d of diags) {
+        if (d.severity <= vscode.DiagnosticSeverity.Warning) {
+          const sev = d.severity === vscode.DiagnosticSeverity.Error ? "error" : "warning";
+          diagLines.push(`[${sev}] ${rel}:${d.range.start.line + 1}: ${d.message}`);
+          if (diagLines.length >= 20) { break; }
+        }
+      }
+      if (diagLines.length >= 20) { break; }
+    }
+    if (diagLines.length === 0) { return; }
+    this.postMessage({ type: "assistantStart" });
+    this.postMessage({
+      type: "streamEvent",
+      event: {
+        type: "delta",
+        text: `**VS Code diagnostics detected after file changes:**\n${diagLines.map(l => `- ${l}`).join("\n")}\n\nFix these issues?`,
+      },
+    });
+    this.postMessage({ type: "assistantDone" });
   }
 
   prefillPrompt(text: string): void {
@@ -485,6 +620,26 @@ export class ChatPanel {
         this.postMessage({ type: "loadHistory", messages });
         break;
       }
+      case "setPlanMode": {
+        this.planMode = Boolean(msg.enabled);
+        await this.context.workspaceState.update("odysseus.planMode", this.planMode);
+        break;
+      }
+      case "rejectTool": {
+        if (this.client && this.sessionId) {
+          await this.client.stopChat(this.sessionId);
+        }
+        break;
+      }
+      case "autoApproveTool": {
+        this.autoApproveSession = true;
+        break;
+      }
+      case "retryAfterError": {
+        const errorCtx = `The previous \`${msg.tool}\` call failed (exit ${msg.exitCode}):\n\`\`\`\n${msg.output}\n\`\`\`\nAnalyze the error and try a different approach.`;
+        void this.handleSend(errorCtx, {});
+        break;
+      }
     }
   }
 
@@ -520,6 +675,11 @@ export class ChatPanel {
 
   private async handleSelectModel(model: string, endpointUrl: string): Promise<void> {
     if (!model || !this.client || !this.sessionId) { return; }
+    if (this.isStreaming) {
+      this.pendingModelSwap = { model, endpointUrl };
+      vscode.window.showInformationMessage(`Odysseus: model will switch to ${model} after the current run.`);
+      return;
+    }
     this.currentModel = model;
     this.currentEndpointUrl = endpointUrl;
     try {
@@ -554,7 +714,7 @@ export class ChatPanel {
     this.client = new OdysseusClient(url, result.token);
     this.docSync = new DocSync(this.client);
     await this.ensureSession();
-    this.panel.webview.html = this.buildHtml("chat", this.currentModel);
+    this.panel.webview.html = this.buildHtml("chat", this.currentModel, this.planMode);
     setTimeout(() => this.sendModelsToWebview(), 300);
     setTimeout(() => this.sendModelsToWebview(), 1000);
   }
@@ -647,7 +807,21 @@ export class ChatPanel {
     const displayMessage = buildDisplayMessage(text, selCtx);
     const isFresh = this.freshSession;
     this.freshSession = false;
-    let apiMessage = await buildApiMessage(displayMessage, workspaceRoot, fileCtx, isFresh);
+    this.currentRunId = Date.now();
+    this.autoApproveSession = false;
+    const maxIterations = cfg.get<number>("maxIterations", 30);
+    const requireApproval = cfg.get<boolean>("requireApproval", true);
+    const injectWorkspaceTree = cfg.get<boolean>("injectWorkspaceTree", true);
+    const injectGitContext = cfg.get<boolean>("injectGitContext", true);
+    const workspaceRules = await getWorkspaceRulesContent();
+    const gitContext = (injectGitContext && workspaceRoot) ? await getGitContext(workspaceRoot) : null;
+    const ignorePatterns = await getIgnorePatterns();
+    const ignoreGlob = ignorePatterns?.length ? patternsToGlob(ignorePatterns) : undefined;
+    const ignoreBlock = ignorePatterns?.length ? buildIgnoreBlock(ignorePatterns) : undefined;
+    let apiMessage = await buildApiMessage(displayMessage, workspaceRoot, fileCtx, isFresh, workspaceRules, gitContext, injectWorkspaceTree, ignoreGlob, ignoreBlock);
+    if (this.planMode) {
+      apiMessage = `<system_instruction>PLAN MODE: You may read files, list directories, and discuss code, but you MUST NOT write to any files or execute bash commands that modify state. Lay out your approach and wait for the user to switch to Act mode.</system_instruction>\n\n` + apiMessage;
+    }
 
     // Resolve @-mention tokens → inject file contents into the API message
     const atMentions = [...text.matchAll(/@([\w./\-]+)/g)].map(m => m[1]);
@@ -664,15 +838,19 @@ export class ChatPanel {
       } catch { /* file not found or unreadable — skip */ }
     }
 
-    ChatPanel.updateStatus("$(sync~spin) Odysseus: thinking…");
+    this.postMessage({ type: "rulesActive", active: !!workspaceRules, preview: workspaceRules?.slice(0, 100) ?? "" });
+    ChatPanel.updateStatusForRun(true);
     this.postMessage({ type: "userMessage", text: displayMessage });
     this.postMessage({ type: "assistantStart" });
 
     const writtenPaths: string[] = [];
+    let stepCount = 0;
+    let lastToolError: { tool: string; output: string; exitCode: number } | undefined;
 
     const attachments = this.pendingAttachments.length > 0 ? [...this.pendingAttachments] : undefined;
     this.pendingAttachments = [];
 
+    this.isStreaming = true;
     try {
       await streamChat({
         baseUrl: url,
@@ -687,6 +865,7 @@ export class ChatPanel {
         incognito,
         presetId,
         attachments,
+        workspace: workspaceRoot ?? undefined,
         tzOffset: Math.round(new Date().getTimezoneOffset() * -1),
         onEvent: (event) => {
           this.postMessage({ type: "streamEvent", event });
@@ -694,22 +873,68 @@ export class ChatPanel {
             this.currentModel = event.model;
             this.postMessage({ type: "modelInfoUpdate", model: event.model });
           }
+          if (event.type === "agent_step") {
+            stepCount = event.round;
+            ChatPanel.updateStatusForRun(true, stepCount);
+            if (stepCount >= maxIterations) {
+              void this.client?.stopChat(this.sessionId!);
+            }
+          }
+          if (event.type === "tool_start" && requireApproval && !this.autoApproveSession) {
+            const tool = event.tool ?? "";
+            if (tool === "bash" || tool === "python") {
+              this.postMessage({ type: "toolApprovalRequest", tool, command: event.command ?? event.tool_input ?? "" });
+            }
+          }
           if (event.type === "metrics") {
             this.postMessage({ type: "metricsUpdate", inputTokens: event.inputTokens, outputTokens: event.outputTokens, tokensPerSec: event.tokensPerSec, contextPct: event.contextPct });
           }
-          // Track files written by the agent so we can refresh them in VS Code
-          if (event.type === "tool_output" && event.exit_code === 0) {
-            const path = parseWrittenPath(event.tool, event.output);
-            if (path) { writtenPaths.push(path); }
+          // Track files written by the agent; track tool errors for inline recovery
+          if (event.type === "tool_output") {
+            if (event.exit_code === 0 || event.exit_code === undefined) {
+              const path = parseWrittenPath(event.tool, event.output);
+              if (path) { writtenPaths.push(path); }
+              lastToolError = undefined;
+            } else {
+              lastToolError = { tool: event.tool, output: event.output.slice(0, 600), exitCode: event.exit_code };
+            }
           }
         },
       });
     } catch (err) {
       this.postMessage({ type: "streamEvent", event: { type: "error", message: String(err) } });
+    } finally {
+      this.isStreaming = false;
     }
 
-    ChatPanel.updateStatus("$(comment) Odysseus: connected");
+    ChatPanel.updateStatusForRun(false);
     this.postMessage({ type: "assistantDone" });
+    if (stepCount > 0) {
+      this.postMessage({ type: "runSummary", steps: stepCount, files: writtenPaths.length });
+    }
+
+    // Inline error recovery: surface unrecovered tool failure
+    if (lastToolError && !this.disposed) {
+      this.postMessage({ type: "toolError", tool: lastToolError.tool, output: lastToolError.output, exitCode: lastToolError.exitCode });
+    }
+
+    // Apply deferred model swap
+    if (this.pendingModelSwap && this.client && this.sessionId) {
+      const { model, endpointUrl } = this.pendingModelSwap;
+      this.pendingModelSwap = undefined;
+      this.currentModel = model;
+      this.currentEndpointUrl = endpointUrl;
+      await this.client.updateSessionModel(this.sessionId, model, endpointUrl).catch(() => {});
+      this.postMessage({ type: "modelChanged", model });
+    }
+
+    if (writtenPaths.length > 0) {
+      void this.checkDiagnosticsAfterRun(writtenPaths);
+    }
+
+    if (this.preEditSnapshots.size > 0 && this.sessionId) {
+      await saveCheckpoints(this.context, this.sessionId, this.currentRunId, this.preEditSnapshots);
+    }
 
     if (!this.sessionAutoNamed && this.client && this.sessionId) {
       this.sessionAutoNamed = true;
@@ -750,7 +975,7 @@ export class ChatPanel {
       .get<boolean>("useCtrlEnterToSend", false);
   }
 
-  private buildHtml(state: "loading" | "disconnected" | "auth" | "chat", initialModel?: string): string {
+  private buildHtml(state: "loading" | "disconnected" | "auth" | "chat", initialModel?: string, initialPlanMode = false): string {
     const useCtrlEnter = this.getUseCtrlEnter();
     const nonce = generateNonce();
     const markedSrc = getMarkedSrc(this.context);
@@ -1349,6 +1574,73 @@ body.verbose .step-badge { display: block; }
   margin-top: 6px;
   opacity: 0.8;
 }
+.rules-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(100,180,100,0.12);
+  border: 1px solid rgba(100,180,100,0.3);
+  color: #7ec57e;
+  font-size: 10px;
+  cursor: default;
+}
+.run-summary-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(100,180,100,0.08);
+  border: 1px solid rgba(100,180,100,0.25);
+  font-size: 11px;
+  opacity: 0.85;
+  margin: 4px 0;
+}
+
+.plan-mode-btn {
+  padding: 2px 9px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  cursor: pointer;
+  background: transparent;
+  color: var(--vscode-foreground);
+  opacity: 0.65;
+  transition: opacity 0.15s, background 0.15s;
+}
+.plan-mode-btn:hover { opacity: 1; }
+.plan-mode-btn.plan-active {
+  background: rgba(224,165,0,0.18);
+  color: #e0a500;
+  border-color: rgba(224,165,0,0.4);
+  opacity: 1;
+}
+.approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  border-radius: 6px;
+  background: rgba(220,120,0,0.08);
+  border: 1px solid rgba(220,120,0,0.3);
+  font-size: 12px;
+}
+.approval-card-header { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.approval-card-cmd { font-family: monospace; font-size: 11px; opacity: 0.8; word-break: break-all; }
+.approval-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.approval-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.approval-btn.approve { background: rgba(100,180,100,0.15); border-color: rgba(100,180,100,0.35); color: #6db46d; }
+.approval-btn.reject  { background: rgba(220,80,80,0.15);  border-color: rgba(220,80,80,0.35);  color: #dc6060; }
+.approval-btn.auto    { background: rgba(100,130,220,0.12); border-color: rgba(100,130,220,0.3); color: var(--vscode-foreground); opacity: 0.8; }
 
 /* ── @-mention picker ───────────────────────────── */
 .at-picker {
@@ -1448,6 +1740,52 @@ body.verbose .step-badge { display: block; }
   font-variant-numeric: tabular-nums;
 }
 .context-indicator.visible { display: flex; }
+.ctx-meter-bar {
+  width: 72px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.1);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ctx-meter-fill {
+  height: 100%;
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.6s ease, background-color 0.6s ease;
+}
+.error-recovery-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  border-radius: 6px;
+  background: rgba(220,60,60,0.08);
+  border: 1px solid rgba(220,60,60,0.3);
+  font-size: 12px;
+}
+.err-header { font-weight: 600; color: #e06060; }
+.err-output {
+  font-family: monospace;
+  font-size: 11px;
+  opacity: 0.8;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 120px;
+  overflow-y: auto;
+  margin: 0;
+}
+.err-actions { display: flex; gap: 6px; margin-top: 2px; }
+.err-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.err-btn.retry   { background: rgba(220,60,60,0.15); border-color: rgba(220,60,60,0.35); color: #e06060; }
+.err-btn.dismiss { background: transparent; border-color: rgba(255,255,255,0.15); color: var(--vscode-foreground); opacity: 0.7; }
 
 /* ── Markdown rendering ─────────────────────────── */
 .msg-body h1,.msg-body h2,.msg-body h3 { font-weight:600; margin:10px 0 4px; line-height:1.3; }
@@ -1524,6 +1862,7 @@ ${state === "chat" ? `
   </div>
   <div id="messages"></div>
   <div class="context-indicator" id="context-indicator">
+    <div class="ctx-meter-bar"><div class="ctx-meter-fill" id="ctx-meter-fill"></div></div>
     <span id="context-token-est">~0 tokens used</span>
   </div>
 
@@ -1572,6 +1911,7 @@ ${state === "chat" ? `
           </div>
         </div>
         <button class="new-chat-btn" id="new-chat-panel-btn" title="New Chat">+</button>
+        <span class="rules-badge" id="rules-badge" style="display:none" title="Workspace rules active">📜 rules</span>
         <button class="icon-btn" id="attach-btn" title="Attach file">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
         </button>
@@ -1588,6 +1928,9 @@ ${state === "chat" ? `
           <button class="mode-btn active" id="mode-agent">Agent</button>
           <button class="mode-btn" id="mode-chat">Chat</button>
         </div>
+        <button class="plan-mode-btn${initialPlanMode ? " plan-active" : ""}" id="plan-mode-btn" title="${initialPlanMode ? "Plan mode: agent won\\'t write files. Click to switch to Act mode." : "Act mode: agent can write files. Click to switch to Plan mode."}">
+          ${initialPlanMode ? "📋 Plan" : "⚡ Act"}
+        </button>
         <button class="stop-btn" id="stop-btn" style="display:none" title="Stop">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
         </button>
@@ -1805,6 +2148,60 @@ document.addEventListener('keydown', e => {
 });
 if (modeAgent) modeAgent.addEventListener('click', () => { agentMode = true;  modeAgent.classList.add('active'); modeChat?.classList.remove('active'); });
 if (modeChat)  modeChat.addEventListener('click',  () => { agentMode = false; modeChat.classList.add('active');  modeAgent?.classList.remove('active'); });
+
+/* ── Plan / Act mode ────────────────────────────── */
+let planMode = ${initialPlanMode ? "true" : "false"};
+let autoApproveSession = false;
+const planModeBtn = document.getElementById('plan-mode-btn');
+function applyPlanModeUI() {
+  if (!planModeBtn) return;
+  if (planMode) {
+    planModeBtn.textContent = '📋 Plan';
+    planModeBtn.classList.add('plan-active');
+    planModeBtn.title = "Plan mode: agent won't write files. Click to switch to Act mode.";
+  } else {
+    planModeBtn.textContent = '⚡ Act';
+    planModeBtn.classList.remove('plan-active');
+    planModeBtn.title = 'Act mode: agent can write files. Click to switch to Plan mode.';
+  }
+}
+if (planModeBtn) {
+  planModeBtn.addEventListener('click', () => {
+    planMode = !planMode;
+    autoApproveSession = false;
+    applyPlanModeUI();
+    vscode.postMessage({ type: 'setPlanMode', enabled: planMode });
+  });
+}
+
+/* ── Approval gate ──────────────────────────────── */
+function showApprovalCard(tool, command) {
+  if (!messagesEl) return;
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.id = 'approval-card-' + Date.now();
+  const displayCmd = command ? command.slice(0, 200) + (command.length > 200 ? '…' : '') : tool;
+  card.innerHTML =
+    '<div class="approval-card-header">🛡️ Tool: <code>' + tool + '</code></div>' +
+    '<div class="approval-card-cmd">' + displayCmd.replace(/</g,'&lt;') + '</div>' +
+    '<div class="approval-actions">' +
+      '<button class="approval-btn approve" data-card="' + card.id + '">✓ Continue</button>' +
+      '<button class="approval-btn reject"  data-card="' + card.id + '">✗ Stop run</button>' +
+      '<button class="approval-btn auto"    data-card="' + card.id + '">⚡ Auto-approve session</button>' +
+    '</div>';
+  messagesEl.appendChild(card);
+  scrollBottom();
+  card.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const action = btn.classList.contains('approve') ? 'approve'
+                   : btn.classList.contains('reject')  ? 'reject' : 'auto';
+      if (action === 'reject') { vscode.postMessage({ type: 'rejectTool' }); }
+      if (action === 'auto')   { autoApproveSession = true; vscode.postMessage({ type: 'autoApproveTool' }); }
+      card.remove();
+      e.stopPropagation();
+    });
+  });
+}
 
 /* ── New chat button ────────────────────────────── */
 const newChatPanelBtn = document.getElementById('new-chat-panel-btn');
@@ -2396,6 +2793,7 @@ const contextIndicator = document.getElementById('context-indicator');
 const contextTokenEst  = document.getElementById('context-token-est');
 let lastMetrics = null;
 
+const ctxMeterFill = document.getElementById('ctx-meter-fill');
 function updateContextIndicator() {
   if (lastMetrics) {
     const { inputTokens, outputTokens, tokensPerSec, contextPct } = lastMetrics;
@@ -2406,12 +2804,22 @@ function updateContextIndicator() {
     if (contextPct != null) text += ' · ' + contextPct.toFixed(0) + '% ctx';
     if (contextTokenEst) contextTokenEst.textContent = text;
     contextIndicator?.classList.toggle('visible', total > 0);
+    if (ctxMeterFill && contextPct != null) {
+      const pct = Math.min(100, Math.max(0, contextPct));
+      ctxMeterFill.style.width = pct + '%';
+      ctxMeterFill.style.backgroundColor = pct < 50 ? '#4caf50' : pct < 80 ? '#ff9800' : '#f44336';
+    }
   } else {
     const chars = messagesEl ? (messagesEl.textContent?.length ?? 0) : 0;
     const est = Math.round(chars / 4);
     const display = est >= 1000 ? (est / 1000).toFixed(1) + 'k' : String(est);
     if (contextTokenEst) contextTokenEst.textContent = '~' + display + ' tokens used';
     contextIndicator?.classList.toggle('visible', chars > 0);
+    if (ctxMeterFill) {
+      const pct = Math.min(100, Math.round(est / 2000 * 100));
+      ctxMeterFill.style.width = pct + '%';
+      ctxMeterFill.style.backgroundColor = pct < 50 ? '#4caf50' : pct < 80 ? '#ff9800' : '#f44336';
+    }
   }
 }
 
@@ -2887,6 +3295,57 @@ window.addEventListener('message', e => {
       if (authError) { authError.textContent = 'Enter your 2FA code.'; authError.style.display = ''; }
       if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
       break;
+    case 'rulesActive': {
+      const rulesBadge = document.getElementById('rules-badge');
+      if (rulesBadge) {
+        rulesBadge.style.display = msg.active ? '' : 'none';
+        if (msg.active && msg.preview) rulesBadge.title = '\\u{1F4DC} Workspace rules: ' + String(msg.preview).slice(0, 100);
+      }
+      break;
+    }
+    case 'runSummary': {
+      if (!messagesEl) break;
+      const summaryChip = document.createElement('div');
+      summaryChip.className = 'run-summary-chip';
+      const files = msg.files || 0;
+      summaryChip.textContent = '\\u2705 Task complete — ' + msg.steps + ' step' + (msg.steps === 1 ? '' : 's') +
+        (files > 0 ? ' · ' + files + ' file' + (files === 1 ? '' : 's') + ' modified' : '');
+      messagesEl.appendChild(summaryChip);
+      scrollBottom();
+      break;
+    }
+    case 'planModeState': {
+      planMode = !!msg.enabled;
+      autoApproveSession = false;
+      applyPlanModeUI();
+      break;
+    }
+    case 'toolApprovalRequest': {
+      if (autoApproveSession) break;
+      showApprovalCard(msg.tool || 'tool', msg.command || '');
+      break;
+    }
+    case 'toolError': {
+      if (!messagesEl) break;
+      const card = document.createElement('div');
+      card.className = 'error-recovery-card';
+      const safeOut = (msg.output || '').replace(/</g, '&lt;');
+      card.innerHTML =
+        '<div class="err-header">⚠ Tool call failed (exit ' + msg.exitCode + '): ' + (msg.tool || '') + '</div>' +
+        '<pre class="err-output">' + safeOut + '</pre>' +
+        '<div class="err-actions">' +
+          '<button class="err-btn retry">↩ Ask agent to retry</button>' +
+          '<button class="err-btn dismiss">Dismiss</button>' +
+        '</div>';
+      card.querySelector('.retry')?.addEventListener('click', () => {
+        card.remove();
+        vscode.postMessage({ type: 'retryAfterError', tool: msg.tool, output: msg.output, exitCode: msg.exitCode });
+      });
+      card.querySelector('.dismiss')?.addEventListener('click', () => card.remove());
+      messagesEl.appendChild(card);
+      scrollBottom();
+      break;
+    }
   }
 });
 

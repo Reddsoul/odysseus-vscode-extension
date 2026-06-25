@@ -9,3 +9,4 @@ TASKS.md
 *.sh
 .smbdelete*
 .gitignore
+.claude/
