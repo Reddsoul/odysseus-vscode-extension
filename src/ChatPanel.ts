@@ -1905,18 +1905,26 @@ ${state === "chat" ? `
     <div class="chat-input-top" style="position:relative;">
       <div class="at-picker" id="at-picker"></div>
       <div class="slash-menu" id="slash-menu"></div>
-      <textarea id="message" placeholder="Message Odysseus…" rows="1" autocomplete="off" spellcheck="false"></textarea>
+      <textarea id="message" placeholder="Ask Odysseus to code, debug, or explain…" rows="1" autocomplete="off" spellcheck="false"></textarea>
     </div>
     <div class="chat-input-bottom">
       <div class="chat-input-left">
         <div class="overflow-menu" id="overflow-menu">
-          <button class="overflow-row icon-btn" id="preset-btn" title="Switch preset/persona">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 1 0-16 0"/></svg>
-            <span id="preset-label">Default</span>
-          </button>
           <button class="overflow-row icon-btn" id="verbose-btn" title="Verbose — show thinking &amp; tool args (Ctrl+O toggles all)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
             <span>Verbose</span>
+          </button>
+          <button class="overflow-row icon-btn active" id="web-btn" title="Toggle web search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <span>Web search</span>
+          </button>
+          <button class="overflow-row icon-btn active" id="bash-btn" title="Toggle shell commands">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <span>Bash</span>
+          </button>
+          <button class="overflow-row icon-btn active" id="mode-toggle-btn" title="Toggle agent / chat mode">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+            <span id="mode-toggle-label">Agent</span>
           </button>
           <button class="overflow-row icon-btn" id="rag-btn" title="Personal docs (RAG)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
@@ -1926,9 +1934,9 @@ ${state === "chat" ? `
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
             <span>Research</span>
           </button>
-          <button class="overflow-row icon-btn" id="incognito-btn" title="Incognito — no memory injection">
+          <button class="overflow-row icon-btn" id="incognito-btn" title="Skip Odysseus memory injection for this message">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-            <span>Incognito</span>
+            <span>No memory</span>
           </button>
         </div>
         <div class="model-picker-wrap">
@@ -1948,19 +1956,9 @@ ${state === "chat" ? `
         <button class="icon-btn" id="attach-btn" title="Attach file">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
         </button>
-        <button class="icon-btn active" id="web-btn" title="Web search">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        </button>
-        <button class="icon-btn active" id="bash-btn" title="Shell commands">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-        </button>
         <button class="icon-btn" id="overflow-btn" title="More options">⋯</button>
       </div>
       <div class="chat-input-right">
-        <div class="mode-toggle">
-          <button class="mode-btn active" id="mode-agent">Agent</button>
-          <button class="mode-btn" id="mode-chat">Chat</button>
-        </div>
         <button class="plan-mode-btn${initialPlanMode ? " plan-active" : ""}" id="plan-mode-btn" title="${initialPlanMode ? "Plan mode: agent won\\'t write files. Click to switch to Act mode." : "Act mode: agent can write files. Click to switch to Plan mode."}">
           ${initialPlanMode ? "📋 Plan" : "⚡ Act"}
         </button>
@@ -2118,27 +2116,27 @@ if (researchBtn) researchBtn.addEventListener('click', () => {
 });
 
 /* ── Toolbar toggles ────────────────────────────── */
-const webBtn       = document.getElementById('web-btn');
-const bashBtn      = document.getElementById('bash-btn');
-const ragBtn       = document.getElementById('rag-btn');
-const incognitoBtn = document.getElementById('incognito-btn');
-const modeAgent = document.getElementById('mode-agent');
-const modeChat  = document.getElementById('mode-chat');
+const webBtn          = document.getElementById('web-btn');
+const bashBtn         = document.getElementById('bash-btn');
+const ragBtn          = document.getElementById('rag-btn');
+const incognitoBtn    = document.getElementById('incognito-btn');
+const modeToggleBtn   = document.getElementById('mode-toggle-btn');
+const modeToggleLabel = document.getElementById('mode-toggle-label');
 let useWeb        = true;
 let useBash       = true;
 let useRag        = false;
 let incognitoMode = false;
-let agentMode = true;
+let agentMode     = true;
 
-if (webBtn)       webBtn.addEventListener('click',       () => { useWeb        = !useWeb;        webBtn.classList.toggle('active',       useWeb);        });
-if (bashBtn)      bashBtn.addEventListener('click',      () => { useBash       = !useBash;       bashBtn.classList.toggle('active',      useBash);       });
-if (ragBtn)       ragBtn.addEventListener('click',       () => { useRag        = !useRag;        ragBtn.classList.toggle('active',       useRag);        });
-if (incognitoBtn) incognitoBtn.addEventListener('click', () => { incognitoMode = !incognitoMode; incognitoBtn.classList.toggle('active', incognitoMode); });
-
-const presetBtn   = document.getElementById('preset-btn');
-const presetLabel = document.getElementById('preset-label');
-let currentPresetId = '';
-if (presetBtn) presetBtn.addEventListener('click', () => vscode.postMessage({ type: 'requestPresets' }));
+if (webBtn)        webBtn.addEventListener('click',        () => { useWeb        = !useWeb;        webBtn.classList.toggle('active',        useWeb);        });
+if (bashBtn)       bashBtn.addEventListener('click',       () => { useBash       = !useBash;       bashBtn.classList.toggle('active',       useBash);       });
+if (ragBtn)        ragBtn.addEventListener('click',        () => { useRag        = !useRag;        ragBtn.classList.toggle('active',        useRag);        });
+if (incognitoBtn)  incognitoBtn.addEventListener('click',  () => { incognitoMode = !incognitoMode; incognitoBtn.classList.toggle('active',  incognitoMode); });
+if (modeToggleBtn) modeToggleBtn.addEventListener('click', () => {
+  agentMode = !agentMode;
+  modeToggleBtn.classList.toggle('active', agentMode);
+  if (modeToggleLabel) modeToggleLabel.textContent = agentMode ? 'Agent' : 'Chat';
+});
 
 /* ── Verbose toggle ─────────────────────────────── */
 const verboseBtn = document.getElementById('verbose-btn');
@@ -2179,9 +2177,6 @@ document.addEventListener('keydown', e => {
     sections.forEach(s => setThinkingOpen(s, anyClosed));
   }
 });
-if (modeAgent) modeAgent.addEventListener('click', () => { agentMode = true;  modeAgent.classList.add('active'); modeChat?.classList.remove('active'); });
-if (modeChat)  modeChat.addEventListener('click',  () => { agentMode = false; modeChat.classList.add('active');  modeAgent?.classList.remove('active'); });
-
 /* ── Plan / Act mode ────────────────────────────── */
 let planMode = ${initialPlanMode ? "true" : "false"};
 let autoApproveSession = false;
@@ -2392,7 +2387,6 @@ function trySend() {
     allowWebSearch: useWeb,
     allowRag: useRag,
     incognito: incognitoMode,
-    presetId: currentPresetId || undefined,
     includeFile: !fileCtxDismissed && !!fileCtxPill,
     includeSelection: !selCtxDismissed && !!selCtxPill,
   }});
@@ -2433,8 +2427,8 @@ const TOOL_META = {
   write_file:      { badge: 'write',   badgeCls: 'write-badge',  name: 'write file', autoOpen: false },
   create_document: { badge: 'doc',     badgeCls: '',             name: 'create doc', autoOpen: false },
   edit_document:   { badge: 'doc',     badgeCls: '',             name: 'edit doc',   autoOpen: false },
-  manage_memory:   { badge: 'memory',  badgeCls: '',             name: 'memory',     autoOpen: false },
-  manage_notes:    { badge: 'notes',   badgeCls: '',             name: 'notes',      autoOpen: false },
+  manage_memory:   { badge: 'memory',  badgeCls: '',             name: 'memory',     autoOpen: false, quiet: true },
+  manage_notes:    { badge: 'notes',   badgeCls: '',             name: 'notes',      autoOpen: false, quiet: true },
 };
 
 let currentRound = 0;
@@ -2609,9 +2603,20 @@ function addTool(tool, command, round, toolInput) {
     currentAssistantEl.appendChild(hdr);
   }
 
+  const meta = TOOL_META[tool] || { badge: tool, badgeCls: '', name: tool, autoOpen: false };
+
+  if (meta.quiet) {
+    const qchip = document.createElement('div');
+    qchip.className = 'info-chip';
+    qchip.textContent = '🧠 Odysseus updating memory…';
+    currentAssistantEl.appendChild(qchip);
+    currentToolWrap = null;
+    scrollBottom();
+    return;
+  }
+
   currentToolWrap = document.createElement('div');
   currentToolWrap.className = 'tool-wrap';
-  const meta = TOOL_META[tool] || { badge: tool, badgeCls: '', name: tool, autoOpen: false };
   const cmd = command ? esc(command.length > 120 ? command.slice(0,120) + '…' : command) : '';
   const chip = document.createElement('button');
   chip.className = 'tool-chip running';
@@ -3079,7 +3084,7 @@ window.addEventListener('message', e => {
         const wrap = document.createElement('div');
         const chip = document.createElement('button');
         chip.className = 'info-chip';
-        chip.textContent = '🧠 ' + ev.count + ' memor' + (ev.count === 1 ? 'y' : 'ies') + ' used';
+        chip.textContent = '🧠 Odysseus loaded ' + ev.count + ' memor' + (ev.count === 1 ? 'y' : 'ies');
         const detail = document.createElement('div');
         detail.className = 'info-chip-detail';
         detail.textContent = ev.items.map(m => '• ' + m.text.slice(0, 80)).join('\\n');
@@ -3205,19 +3210,6 @@ window.addEventListener('message', e => {
       div.textContent = '— switched to: ' + String(msg.sessionName || 'session') + ' —';
       messagesEl?.appendChild(div);
       scrollBottom();
-      break;
-    }
-    case 'presetsLoaded': {
-      const presets = msg.presets || [];
-      const items = [{ id: '', name: 'Default' }, ...presets];
-      const names = items.map(p => p.name + (p.character_name ? ' — ' + p.character_name : ''));
-      let idx = 0;
-      // Simple sequential selection via a pseudo-cycle on repeated clicks
-      const cur = items.findIndex(p => p.id === currentPresetId);
-      idx = (cur + 1) % items.length;
-      currentPresetId = items[idx].id;
-      if (presetLabel) presetLabel.textContent = items[idx].name;
-      if (presetBtn) presetBtn.classList.toggle('active', !!currentPresetId);
       break;
     }
     case 'searchResults': {

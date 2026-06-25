@@ -2,6 +2,8 @@
 
 VS Code extension for a self-hosted Odysseus AI assistant. Connects to your local Odysseus server and gives you an agent-capable chat panel directly inside VS Code.
 
+[Github](https://github.com/Reddsoul/odysseus-vscode-extension)
+
 ## Requirements
 
 - Odysseus server running (default `http://localhost:7860`)

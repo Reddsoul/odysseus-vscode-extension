@@ -1,8 +1,6 @@
 import * as vscode from "vscode";
 import { OdysseusViewProvider } from "./OdysseusViewProvider";
 import { ChatPanel } from "./ChatPanel";
-import { MemoryViewProvider } from "./MemoryViewProvider";
-import { NotesViewProvider } from "./NotesViewProvider";
 import { initRulesWatcher, createOdysseusRulesFile } from "./workspaceRules";
 import { initIgnoreWatcher } from "./odysseusIgnore";
 import { listRevertableRuns, revertRun } from "./checkpointManager";
@@ -25,19 +23,6 @@ export function activate(context: vscode.ExtensionContext): void {
     )
   );
 
-  const memoryProvider = new MemoryViewProvider(context);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("odysseus.memoryView", memoryProvider, {
-      webviewOptions: { retainContextWhenHidden: true },
-    })
-  );
-
-  const notesProvider = new NotesViewProvider(context);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("odysseus.notesView", notesProvider, {
-      webviewOptions: { retainContextWhenHidden: true },
-    })
-  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("odysseus.openChat", () => {
