@@ -625,6 +625,10 @@ export class ChatPanel {
         await this.context.workspaceState.update("odysseus.planMode", this.planMode);
         break;
       }
+      case "approveTool": {
+        void this.handleSend("continue", {});
+        break;
+      }
       case "rejectTool": {
         if (this.client && this.sessionId) {
           await this.client.stopChat(this.sessionId);
@@ -880,10 +884,39 @@ export class ChatPanel {
               void this.client?.stopChat(this.sessionId!);
             }
           }
-          if (event.type === "tool_start" && requireApproval && !this.autoApproveSession) {
+          if (event.type === "tool_start") {
             const tool = event.tool ?? "";
-            if (tool === "bash" || tool === "python") {
-              this.postMessage({ type: "toolApprovalRequest", tool, command: event.command ?? event.tool_input ?? "" });
+            const toolInput = event.tool_input ?? "";
+
+            // Pre-snapshot files that write tools are about to modify, so diffs/reverts work
+            // even for files not in the original active-editor context.
+            const FILE_WRITE_TOOLS = ["write_file", "edit_file", "create_file", "str_replace_editor", "str_replace", "apply_diff", "overwrite_file"];
+            if (FILE_WRITE_TOOLS.includes(tool) && toolInput) {
+              void (async () => {
+                try {
+                  const args = JSON.parse(toolInput);
+                  const relPath: unknown = args.path ?? args.file_path ?? args.target_file ?? args.filename ?? args.target;
+                  if (typeof relPath === "string" && relPath) {
+                    const absPath = workspaceRoot ? path.resolve(workspaceRoot, relPath) : relPath;
+                    if (!this.preEditSnapshots.has(absPath)) {
+                      try {
+                        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(absPath));
+                        this.preEditSnapshots.set(absPath, Buffer.from(bytes).toString("utf-8"));
+                      } catch {
+                        this.preEditSnapshots.set(absPath, ""); // new file — empty baseline
+                      }
+                    }
+                    if (!writtenPaths.includes(absPath)) { writtenPaths.push(absPath); }
+                  }
+                } catch { /* tool_input not JSON or no path field — skip */ }
+              })();
+            }
+
+            if (requireApproval && !this.autoApproveSession) {
+              const APPROVAL_TOOLS = ["bash", "python", "write_file", "edit_file", "create_file", "overwrite_file"];
+              if (APPROVAL_TOOLS.includes(tool)) {
+                this.postMessage({ type: "toolApprovalRequest", tool, command: event.command ?? toolInput ?? "" });
+              }
             }
           }
           if (event.type === "metrics") {
@@ -2195,6 +2228,7 @@ function showApprovalCard(tool, command) {
     btn.addEventListener('click', e => {
       const action = btn.classList.contains('approve') ? 'approve'
                    : btn.classList.contains('reject')  ? 'reject' : 'auto';
+      if (action === 'approve') { vscode.postMessage({ type: 'approveTool' }); }
       if (action === 'reject') { vscode.postMessage({ type: 'rejectTool' }); }
       if (action === 'auto')   { autoApproveSession = true; vscode.postMessage({ type: 'autoApproveTool' }); }
       card.remove();
@@ -3369,15 +3403,16 @@ interface SendOpts {
   includeSelection?: boolean;
 }
 
-/** Parse file path from write_file or bash tool output. Returns null if not found. */
+/** Parse file path from a file-write tool output. Returns null if not found. */
 function parseWrittenPath(tool: string, output: string): string | null {
-  if (tool === "write_file") {
-    // "Wrote 1234 bytes to /full/path/to/file"
-    const m = output.match(/Wrote \d+ bytes to (.+)/);
+  const FILE_WRITE_TOOLS = ["write_file", "edit_file", "create_file", "overwrite_file", "str_replace_editor", "str_replace", "apply_diff"];
+  if (FILE_WRITE_TOOLS.includes(tool)) {
+    // "Wrote 1234 bytes to /path"  |  "Written to /path"  |  "Saved /path"  |  "File: /path"
+    const m = output.match(/(?:Wrote?\s+\d+\s+bytes?\s+to|Written\s+to|Saved\s+to|Created\s+at|Updated\s*file:?|Modified:?|File:)\s*([\/][^\s\n]+)/i)
+           ?? output.match(/([\/][^\s\n"']+\.[\w]+)/); // fallback: first absolute path with extension
     return m ? m[1].trim() : null;
   }
   if (tool === "bash") {
-    // Look for common patterns: "> /path", "written to /path", "saved /path"
     const m = output.match(/(?:written to|saved to|created at|output:)\s+([\/~][^\s]+)/i)
            ?? output.match(/>\s+([\/][^\s\n]+)/);
     return m ? m[1].trim() : null;

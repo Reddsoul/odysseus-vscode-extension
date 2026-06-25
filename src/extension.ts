@@ -9,6 +9,7 @@ import { listRevertableRuns, revertRun } from "./checkpointManager";
 import { runHeadlessTask, listTaskHistory } from "./taskRunner";
 import { initScheduler, listSchedules, addSchedule, removeSchedule, toggleSchedule, getNextRunLabel, validateCron, nextCronDate } from "./scheduler";
 import { generateCommitMessage } from "./gitPanel";
+import { SchedulerViewProvider } from "./SchedulerViewProvider";
 
 export function activate(context: vscode.ExtensionContext): void {
   initRulesWatcher(context);
@@ -151,6 +152,15 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showInformationMessage(`Reverted ${restored} file(s) to pre-run state.`);
       }
     })
+  );
+
+  const schedulerProvider = new SchedulerViewProvider(context);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      SchedulerViewProvider.viewId,
+      schedulerProvider,
+      { webviewOptions: { retainContextWhenHidden: true } }
+    )
   );
 
   // Start scheduler polling engine

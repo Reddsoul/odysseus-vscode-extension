@@ -2,7 +2,7 @@
   "name": "odysseus",
   "displayName": "Odysseus vscode Extension",
   "description": "Chat panel for Odysseus — a self-hosted AI assistant with agent tools, streaming, and session management.",
-  "version": "0.0.14",
+  "version": "0.0.16",
   "publisher": "JoseAlma",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -235,6 +235,12 @@
           "type": "webview",
           "id": "odysseus.notesView",
           "name": "Notes",
+          "icon": "resources/icon.svg"
+        },
+        {
+          "type": "webview",
+          "id": "odysseus.schedulerView",
+          "name": "Schedules",
           "icon": "resources/icon.svg"
         }
       ]
