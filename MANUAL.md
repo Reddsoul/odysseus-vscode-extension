@@ -128,8 +128,18 @@ Every message sent to the agent automatically includes:
 | Workspace tree | File listing (up to 500 files, respects `.gitignore`) |
 | Workspace rules | Contents of `.odysseusrules` if present |
 | File restrictions | Patterns from `.odysseusignore` |
+| **Relevant files** | Contents of files the index scores as relevant to your message |
 
 Toggle git context and workspace tree via `odysseus.injectGitContext` and `odysseus.injectWorkspaceTree` in Settings.
+
+### Workspace index
+
+On startup the extension silently builds a local index of your workspace — file paths, languages, and symbol names (functions, classes, methods) extracted via VS Code's language servers. Before each message, the index is queried against your input to find the most relevant files, whose full contents are injected automatically so the agent doesn't need to read them manually via bash.
+
+- **Automatic** — builds in the background at startup, no setup required.
+- **Incremental** — file watchers keep the index up to date as you edit.
+- **Persistent** — stored in VS Code's extension storage (not in your workspace). Rebuilt if older than 30 minutes.
+- **Force rebuild** — Command Palette → `Odysseus: Rebuild Workspace Index`.
 
 ### @-mentions
 
@@ -507,3 +517,8 @@ This opens VS Code, focuses the Odysseus panel, and pre-fills the chat input wit
 - Run `/compact` to summarize old messages.
 - Run `/truncate` to drop earlier turns.
 - Start a new session with `/new`.
+
+**Workspace index not picking up relevant files**
+- The index builds once at startup and stays warm via file watchers. If you opened a large new project, run `Odysseus: Rebuild Workspace Index` from the Command Palette to force a fresh full scan.
+- Binary files, files over 50 KB, and files matching standard exclusions (`node_modules`, `dist`, `*.log`, etc.) are skipped intentionally.
+- If your language server isn't running yet at startup, symbol extraction falls back to path-only matching. Restart VS Code (which re-triggers indexing) once the language server is active.

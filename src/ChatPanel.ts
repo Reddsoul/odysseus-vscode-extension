@@ -10,7 +10,9 @@ import {
   getWorkspaceRoot,
   buildDisplayMessage,
   buildApiMessage,
+  RelevantFile,
 } from "./context/fileContext";
+import { WorkspaceIndexManager } from "./context/workspaceIndex";
 import { getWorkspaceRulesContent } from "./workspaceRules";
 import { getGitContext } from "./gitIntegration";
 import { saveCheckpoints } from "./checkpointManager";
@@ -74,6 +76,11 @@ export class ChatPanel {
 
   /** Called when the chat panel is disposed, so the sidebar can refresh its list. */
   public static onDidClose?: () => void;
+
+  private static _workspaceIndex?: WorkspaceIndexManager;
+  public static setWorkspaceIndex(idx: WorkspaceIndexManager): void {
+    ChatPanel._workspaceIndex = idx;
+  }
 
   public static createOrShow(context: vscode.ExtensionContext, sessionId?: string): ChatPanel {
     // If a specific session is requested and already open, focus it
@@ -822,7 +829,29 @@ export class ChatPanel {
     const ignorePatterns = await getIgnorePatterns();
     const ignoreGlob = ignorePatterns?.length ? patternsToGlob(ignorePatterns) : undefined;
     const ignoreBlock = ignorePatterns?.length ? buildIgnoreBlock(ignorePatterns) : undefined;
-    let apiMessage = await buildApiMessage(displayMessage, workspaceRoot, fileCtx, isFresh, workspaceRules, gitContext, injectWorkspaceTree, ignoreGlob, ignoreBlock);
+
+    // Query workspace index for files relevant to this message
+    let relevantFiles: RelevantFile[] | undefined;
+    if (ChatPanel._workspaceIndex && workspaceRoot) {
+      const matches = ChatPanel._workspaceIndex.queryIndex(text, 8);
+      if (matches.length > 0) {
+        const MAX_FILE_BYTES = 50 * 1024;
+        const loaded = await Promise.all(
+          matches.map(async (f) => {
+            try {
+              const uri = vscode.Uri.file(require("path").join(workspaceRoot, f.relPath));
+              const stat = await vscode.workspace.fs.stat(uri);
+              if (stat.size > MAX_FILE_BYTES) { return null; }
+              const bytes = await vscode.workspace.fs.readFile(uri);
+              return { relPath: f.relPath, content: Buffer.from(bytes).toString("utf-8") } as RelevantFile;
+            } catch { return null; }
+          })
+        );
+        relevantFiles = loaded.filter((f): f is RelevantFile => f !== null);
+      }
+    }
+
+    let apiMessage = await buildApiMessage(displayMessage, workspaceRoot, fileCtx, isFresh, workspaceRules, gitContext, injectWorkspaceTree, ignoreGlob, ignoreBlock, relevantFiles);
     if (this.planMode) {
       apiMessage = `<system_instruction>PLAN MODE: You may read files, list directories, and discuss code, but you MUST NOT write to any files or execute bash commands that modify state. Lay out your approach and wait for the user to switch to Act mode.</system_instruction>\n\n` + apiMessage;
     }

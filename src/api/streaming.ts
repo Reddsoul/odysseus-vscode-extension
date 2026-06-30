@@ -63,7 +63,7 @@ export async function streamChat(opts: StreamChatOptions): Promise<void> {
   const body = parts.join("\r\n") + `\r\n--${boundary}--\r\n`;
   const bodyBuf = Buffer.from(body, "utf-8");
 
-  const url = new URL(`${baseUrl}/api/chat_stream`);
+  const url = new URL(`${baseUrl.replace(/\/$/, "")}/api/chat_stream`);
   const isHttps = url.protocol === "https:";
   const lib = isHttps ? https : http;
 

@@ -91,6 +91,11 @@ export function buildDisplayMessage(
   );
 }
 
+export interface RelevantFile {
+  relPath: string;
+  content: string;
+}
+
 /** Builds the message sent to the API — includes workspace context the model needs but the user doesn't need to see. */
 export async function buildApiMessage(
   displayMessage: string,
@@ -101,7 +106,8 @@ export async function buildApiMessage(
   gitContext?: string | null,
   injectWorkspaceTree = true,
   ignoreGlob?: string,
-  ignoreBlock?: string
+  ignoreBlock?: string,
+  relevantFiles?: RelevantFile[]
 ): Promise<string> {
   const lines: string[] = [];
   if (workspaceRules) {
@@ -161,6 +167,15 @@ export async function buildApiMessage(
       lines.push(`<vscode_diagnostics>`);
       lines.push(diagCtx);
       lines.push(`</vscode_diagnostics>`);
+    }
+    if (relevantFiles && relevantFiles.length > 0) {
+      lines.push(`<relevant_files>`);
+      for (const rf of relevantFiles) {
+        lines.push(`// ${rf.relPath}`);
+        lines.push(rf.content);
+        lines.push(``);
+      }
+      lines.push(`</relevant_files>`);
     }
     lines.push(`</vscode_workspace>`);
     if (gitContext) {

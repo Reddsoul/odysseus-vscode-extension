@@ -8,6 +8,7 @@ import { runHeadlessTask, listTaskHistory } from "./taskRunner";
 import { initScheduler, listSchedules, addSchedule, removeSchedule, toggleSchedule, getNextRunLabel, validateCron, nextCronDate } from "./scheduler";
 import { generateCommitMessage } from "./gitPanel";
 import { SchedulerViewProvider } from "./SchedulerViewProvider";
+import { WorkspaceIndexManager } from "./context/workspaceIndex";
 
 export function activate(context: vscode.ExtensionContext): void {
   initRulesWatcher(context);
@@ -74,6 +75,23 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.show();
   context.subscriptions.push(statusBar);
   ChatPanel.setStatusBar(statusBar);
+
+  // Workspace index — build async on activate, expose rebuild command
+  const workspaceIndex = new WorkspaceIndexManager(context);
+  context.subscriptions.push({ dispose: () => workspaceIndex.dispose() });
+  ChatPanel.setWorkspaceIndex(workspaceIndex);
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (workspaceRoot) {
+    void workspaceIndex.buildIndex(workspaceRoot);
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("odysseus.rebuildWorkspaceIndex", () => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) { vscode.window.showWarningMessage("No workspace folder open."); return; }
+      void workspaceIndex.buildIndex(root, { force: true });
+    })
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("odysseus.searchMessages", async () => {

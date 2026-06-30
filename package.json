@@ -2,7 +2,7 @@
   "name": "odysseus",
   "displayName": "Odysseus vscode Extension",
   "description": "Chat panel for Odysseus — a self-hosted AI assistant with agent tools, streaming, and session management.",
-  "version": "0.0.18",
+  "version": "0.0.20",
   "publisher": "JoseAlma",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -72,6 +72,11 @@
       {
         "command": "odysseus.cancelRun",
         "title": "Cancel Active Run",
+        "category": "Odysseus"
+      },
+      {
+        "command": "odysseus.rebuildWorkspaceIndex",
+        "title": "Rebuild Workspace Index",
         "category": "Odysseus"
       },
       {
@@ -236,8 +241,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "compile": "node node_modules/typescript/bin/tsc -p ./",
+    "watch": "node node_modules/typescript/bin/tsc -watch -p ./"
   },
   "devDependencies": {
     "@types/node": "^25.9.2",

@@ -4,6 +4,8 @@ VS Code extension for a self-hosted Odysseus AI assistant. Connects to your loca
 
 [Github](https://github.com/Reddsoul/odysseus-vscode-extension)
 
+For issues, gripes and whishlist items, add them to Gripesheet.md with your name and the context of it. 
+
 ## Requirements
 
 - Odysseus server running (default `http://localhost:7860`)
@@ -60,6 +62,7 @@ VS Code extension for a self-hosted Odysseus AI assistant. Connects to your loca
 - `odysseus.sendSelection` command — appends a `@file:line` reference to the chat input
 - Workspace file listing (gitignore-aware) sent as context on every message
 - **Git context injection** — `git status` and `git diff --stat HEAD` automatically included as context (toggle with `odysseus.injectGitContext`)
+- **Workspace index** — on startup the extension silently indexes workspace symbols (functions, classes, methods) and injects the most relevant files' contents automatically with every message. Updated incrementally as files change. Force rebuild with `Odysseus: Rebuild Workspace Index`.
 
 ### Message History
 - **Edit & delete past messages** — hover any message in the conversation history to reveal edit and delete buttons. Edit a message to re-send it to the agent; delete to remove it.
